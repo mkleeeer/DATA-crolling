@@ -31,7 +31,9 @@ def process_image(row: dict) -> None:
             SPREADSHEET_ID, "images", row_number,
             {
                 "status": "downloaded",
-                "error": "",
+                # Not a failure, but worth seeing in the sheet: nothing new
+                # was written, the row points at the earlier copy.
+                "error": "중복: 이미 받은 파일이라 새로 저장하지 않음" if record.get("duplicate") else "",
                 "filename": record["filename"],
                 "local_path": record["local_path"],
                 "original_path": record["original_path"] or "",

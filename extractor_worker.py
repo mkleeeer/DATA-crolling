@@ -27,6 +27,54 @@ MAX_CANDIDATE_ASPECT_RATIO = 3.0
 _ROW_PACING_SECONDS = 0.4
 
 
+# File signatures pipeline.download_and_process() knows how to save — checked
+# on the first bytes only, so a file served with a generic Content-Type
+# (application/octet-stream, binary/octet-stream, missing) is still handed to
+# the download step instead of being parsed as an HTML page.
+_FILE_SIGNATURES = (
+    b"%PDF-",                        # PDF
+    b"PK\x03\x04", b"PK\x05\x06",    # ZIP / EPUB
+    b"AT&T",                         # DjVu
+    b"\xff\xd8\xff",                 # JPEG
+    b"\x89PNG\r\n\x1a\n",            # PNG
+    b"GIF87a", b"GIF89a",            # GIF
+)
+
+
+def _looks_like_file(head: bytes) -> bool:
+    if head.startswith(_FILE_SIGNATURES):
+        return True
+    return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+
+
+def _is_direct_file(resp, content_type: str) -> bool:
+    """Decide "file to download" vs. "page to scrape" while reading as little
+    of the body as possible. The download worker fetches a file in full
+    anyway, so pulling the whole thing here too (just to look at a header)
+    meant every PDF crossed the network twice.
+
+    - image/* or application/pdf: trusted as a file, body never read
+    - text/html: a page, body read normally for scraping
+    - anything else: peek at the first chunk's signature; if it's not a
+      known file, the rest is read so the caller can still use resp.text
+    """
+    ctype = content_type.lower()
+    if ctype.startswith("image/") or ctype.startswith("application/pdf"):
+        return True
+    if ctype.startswith("text/html") or ctype.startswith("application/xhtml"):
+        return False
+    chunks = resp.iter_content(chunk_size=8192)
+    head = next(chunks, b"")
+    if _looks_like_file(head):
+        return True
+    # Not a file after all — reassemble the body so resp.text (and its
+    # charset detection) behaves exactly as it would on a non-streamed
+    # response. requests has no public API to "un-peek" a stream.
+    resp._content = head + b"".join(chunks)
+    resp._content_consumed = True
+    return False
+
+
 def _passes_size_filter(dimensions) -> bool:
     if dimensions is None:
         return True  # couldn't determine size — don't punish it for that
@@ -65,19 +113,25 @@ def process_submission(row: dict) -> None:
             SPREADSHEET_ID, "submissions", row_number,
             {"status": "processing"}, sheets.SUBMISSIONS_HEADERS,
         )
-        resp = net.fetch_page(url)
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
+        resp = net.fetch_page(url, stream=True)
+        try:
+            resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "")
+            is_direct_file = _is_direct_file(resp, content_type)
+            if not is_direct_file:
+                page_text = resp.text
+        finally:
+            resp.close()
 
-        if content_type.startswith("image/") or content_type.startswith("application/pdf"):
+        if is_direct_file:
             candidates = [{"url": url, "alt": title}]
         elif settings.get_only_og_image():
             if not source_page:
                 source_page = resp.url
-            og_url = find_og_image(BeautifulSoup(resp.text, "html.parser"), resp.url)
+            og_url = find_og_image(BeautifulSoup(page_text, "html.parser"), resp.url)
             candidates = [{"url": og_url, "alt": title}] if og_url else []
         else:
-            candidates = extract_images_from_html(resp.text, resp.url)
+            candidates = extract_images_from_html(page_text, resp.url)
             if not source_page:
                 source_page = resp.url
             candidates = _filter_candidates_by_size(candidates, resp.url)

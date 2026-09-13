@@ -1,7 +1,10 @@
+import hashlib
 import io
 import os
+import re
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -14,7 +17,7 @@ except ImportError:
 
 import db
 import net
-from scrape import find_pdf_links
+from scrape import find_pdf_links, is_generic_link_text
 
 BASE_DIR = Path(__file__).parent
 DOWNLOADS_DIR = Path(r"G:\내 드라이브\[작업공간]\웹이미지 수집")
@@ -40,18 +43,144 @@ def _relpath(path: Path) -> str:
     return str(path.relative_to(DOWNLOADS_DIR)).replace("\\", "/")
 
 
-def _save_raw(raw: bytes, ext: str, mime_type: str, id_prefix: str, url: str, source_page: str, title: str, job_id: str) -> dict:
+_WINDOWS_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+# Looks like a storage ID rather than a name a person gave the file — a long
+# run of hex/digits (e.g. the BOK CDN's "d8feb2de24a34fe38ef9db25182c8b05").
+_ID_LIKE_STEM = re.compile(r"^[0-9a-fA-F_\-]{16,}$")
+_MAX_STEM_LENGTH = 100
+
+
+def _clean_stem(name: str | None, ext: str) -> str | None:
+    """Turn a human-supplied name into a safe Windows filename stem, or None
+    if nothing usable is left. Drops a trailing ".<ext>" so a link text like
+    "보고서.pdf" doesn't end up saved as "보고서.pdf.pdf"."""
+    if not name:
+        return None
+    stem = unquote(name).strip()
+    if stem.lower().endswith(f".{ext}"):
+        stem = stem[: -(len(ext) + 1)]
+    stem = _WINDOWS_BAD_CHARS.sub("_", stem)
+    stem = re.sub(r"\s+", " ", stem).strip(" .")[:_MAX_STEM_LENGTH].strip(" .")
+    # Button words ("다운로드", "PDF") would make every file "다운로드.pdf".
+    if not stem or is_generic_link_text(stem):
+        return None
+    if stem.lower() in _WINDOWS_RESERVED:
+        stem = f"_{stem}"
+    return stem
+
+
+def content_disposition_name(resp) -> str | None:
+    header = resp.headers.get("Content-Disposition", "") if resp is not None else ""
+    if not header:
+        return None
+    # RFC 5987 form (filename*=UTF-8''%EB%B3%B4...) wins over plain filename=.
+    m = re.search(r"filename\*\s*=\s*([\w-]+)''([^;]+)", header, re.IGNORECASE)
+    if m:
+        try:
+            return unquote(m.group(2).strip().strip('"'), encoding=m.group(1))
+        except LookupError:
+            return unquote(m.group(2).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"([^"]*)"|filename\s*=\s*([^;]+)', header, re.IGNORECASE)
+    if not m:
+        return None
+    value = (m.group(1) if m.group(1) is not None else m.group(2)).strip()
+    # HTTP headers reach Python decoded as latin-1, but Korean servers put
+    # raw UTF-8 (BOK) or CP949 bytes in them — undo that before unquoting.
+    try:
+        raw_bytes = value.encode("latin-1")
+    except UnicodeEncodeError:
+        return unquote(value)
+    for encoding in ("utf-8", "cp949"):
+        try:
+            return unquote(raw_bytes.decode(encoding))
+        except UnicodeDecodeError:
+            continue
+    return unquote(value)
+
+
+def _url_basename(url: str) -> str | None:
+    basename = unquote(urlparse(url).path.rsplit("/", 1)[-1])
+    stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+    if not stem or _ID_LIKE_STEM.match(stem):
+        return None
+    return basename
+
+
+def _pick_filename_stem(ext: str, title: str, resp, link_text: str | None, url: str) -> str | None:
+    """Most deliberate name first: an explicit title (sheet row / API / Link
+    Gopher link text), then what the server itself calls the file
+    (Content-Disposition), then the link text on the landing page the PDF
+    was resolved from, then the URL's own filename if it isn't just an ID."""
+    for candidate in (title, content_disposition_name(resp), link_text, _url_basename(url)):
+        stem = _clean_stem(candidate, ext)
+        if stem:
+            return stem
+    return None
+
+
+def _unique_path(directory: Path, stem: str, ext: str) -> Path:
+    path = directory / f"{stem}.{ext}"
+    n = 2
+    while path.exists():
+        path = directory / f"{stem} ({n}).{ext}"
+        n += 1
+    return path
+
+
+def _existing_file(record: dict) -> bool:
+    return bool(record.get("local_path")) and (DOWNLOADS_DIR / record["local_path"]).is_file()
+
+
+def _as_duplicate(record: dict) -> dict:
+    print(f"[pipeline] duplicate: already saved as {record['local_path']} (id={record['id']})")
+    return {**record, "duplicate": True}
+
+
+def find_saved_by_url(url: str) -> dict | None:
+    for record in db.find_raw_by_source_url(url):
+        if _existing_file(record):
+            return record
+    return None
+
+
+def _find_duplicate_by_hash(sha256: str) -> dict | None:
+    # Files saved before the sha256 column existed get fingerprinted the
+    # first time a duplicate check runs, so they're covered too.
+    for record in db.list_raw_missing_sha256():
+        if _existing_file(record):
+            db.set_sha256(record["id"], hashlib.sha256((DOWNLOADS_DIR / record["local_path"]).read_bytes()).hexdigest())
+    for record in db.find_raw_by_sha256(sha256):
+        if _existing_file(record):
+            return record
+    return None
+
+
+def _save_raw(
+    raw: bytes, ext: str, mime_type: str, id_prefix: str, url: str, source_page: str, title: str, job_id: str,
+    resp=None, link_text: str | None = None,
+) -> dict:
     """Save a non-image file whose real type was determined by signature
     (magic bytes), not by trusting the URL extension or Content-Type —
     shared by PDF/EPUB-ZIP/DjVu, which all just need "write the bytes,
-    record it" with no format-specific processing the way images do."""
+    record it" with no format-specific processing the way images do.
+
+    The same bytes already on disk (by content hash, whatever URL they came
+    from) are not written again — the existing record comes back instead,
+    marked duplicate=True."""
+    sha256 = hashlib.sha256(raw).hexdigest()
+    existing = _find_duplicate_by_hash(sha256)
+    if existing is not None:
+        return _as_duplicate(existing)
+
     job_dir = DOWNLOADS_DIR / job_id
     converted_dir = job_dir / "converted"
     converted_dir.mkdir(parents=True, exist_ok=True)
 
     job_seq = db.next_job_seq(job_id)
     daily_seq = db.next_daily_seq()
-    out_path = converted_dir / f"{job_seq:02d}.{ext}"
+    stem = _pick_filename_stem(ext, title, resp, link_text, url) or f"{job_seq:02d}"
+    out_path = _unique_path(converted_dir, stem, ext)
     out_path.write_bytes(raw)
 
     record = {
@@ -71,13 +200,14 @@ def _save_raw(raw: bytes, ext: str, mime_type: str, id_prefix: str, url: str, so
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "drive_file_id": None,
         "drive_url": None,
+        "sha256": sha256,
     }
     db.insert_image(record)
     return record
 
 
-def _save_pdf(raw: bytes, url: str, source_page: str, title: str, job_id: str) -> dict:
-    return _save_raw(raw, "pdf", "application/pdf", "pdf", url, source_page, title, job_id)
+def _save_pdf(raw: bytes, url: str, source_page: str, title: str, job_id: str, resp=None, link_text: str | None = None) -> dict:
+    return _save_raw(raw, "pdf", "application/pdf", "pdf", url, source_page, title, job_id, resp=resp, link_text=link_text)
 
 
 def _looks_like_epub(raw: bytes) -> bool:
@@ -145,19 +275,33 @@ def _resolve_pdf_from_html(raw: bytes, page_url: str):
     manager resolving a link before fetching it. Look for a direct .pdf link
     on that page and follow it, trying candidates in order until one
     actually verifies as a PDF by magic bytes (not just by extension).
-    Returns (raw_bytes, resolved_url) or (None, None) if nothing panned out."""
+    Returns (raw_bytes, resolved_url, response, link_text) or all None if
+    nothing panned out — link_text is what the page called that file, kept
+    so it can become the saved filename."""
     try:
         soup = BeautifulSoup(raw, "html.parser")
     except Exception:
-        return None, None
+        return None, None, None, None
     for candidate in find_pdf_links(soup, page_url):
         try:
             resp = _fetch_url(candidate)
         except DownloadError:
             continue
         if resp.content[:5] == b"%PDF-":
-            return resp.content, candidate
-    return None, None
+            return resp.content, candidate, resp, _link_text_for(soup, page_url, candidate)
+    return None, None, None, None
+
+
+def _link_text_for(soup: BeautifulSoup, page_url: str, target_url: str) -> str | None:
+    """A page often links the same file several times ("보고서.pdf",
+    "다운로드", "뷰어") — take the first label that actually names it."""
+    for a in soup.find_all("a", href=True):
+        if urljoin(page_url, a["href"].strip()) != target_url:
+            continue
+        for label in (a.get("title"), a.get_text(strip=True)):
+            if _clean_stem(label, "pdf"):
+                return label
+    return None
 
 
 def download_and_process(
@@ -169,6 +313,13 @@ def download_and_process(
     reused automatically across calls."""
     if not url:
         raise DownloadError("url이 필요합니다.")
+
+    # Exact same URL already saved as a file (PDF/EPUB/ZIP/DjVu) that still
+    # exists on disk — skip the network entirely. Different URLs pointing at
+    # the same file are caught later by content hash in _save_raw().
+    existing = find_saved_by_url(url)
+    if existing is not None:
+        return _as_duplicate(existing)
 
     job_id = db.get_or_create_job(folder)
     resp = _fetch_url(url, cookies=cookies)
@@ -184,13 +335,16 @@ def download_and_process(
     # "never trust the header" reasoning as the image path below (a blocked
     # request can come back as an HTML page with an image/pdf Content-Type).
     if raw[:5] == b"%PDF-":
-        return _save_pdf(raw, url, source_page, title, job_id)
+        return _save_pdf(raw, url, source_page, title, job_id, resp=resp)
 
     looks_like_html = content_type.startswith("text/html") or raw.lstrip()[:15].lower().startswith(b"<!doctype html") or raw.lstrip()[:5].lower() == b"<html"
     if looks_like_html:
-        resolved_raw, resolved_url = _resolve_pdf_from_html(raw, resp.url)
+        resolved_raw, resolved_url, resolved_resp, link_text = _resolve_pdf_from_html(raw, resp.url)
         if resolved_raw is not None:
-            return _save_pdf(resolved_raw, resolved_url, source_page or url, title, job_id)
+            return _save_pdf(
+                resolved_raw, resolved_url, source_page or url, title, job_id,
+                resp=resolved_resp, link_text=link_text,
+            )
         # A real image URL never comes back as an HTML document, so there's
         # no point handing this to Pillow — it's an HTML page (login wall,
         # error page, a landing page with no findable PDF link), not a file.
@@ -205,10 +359,10 @@ def download_and_process(
     # confusing "cannot identify image file" error).
     if raw[:4] == b"PK\x03\x04" or raw[:4] == b"PK\x05\x06":
         if _looks_like_epub(raw):
-            return _save_raw(raw, "epub", "application/epub+zip", "epub", url, source_page, title, job_id)
-        return _save_raw(raw, "zip", "application/zip", "zip", url, source_page, title, job_id)
+            return _save_raw(raw, "epub", "application/epub+zip", "epub", url, source_page, title, job_id, resp=resp)
+        return _save_raw(raw, "zip", "application/zip", "zip", url, source_page, title, job_id, resp=resp)
     if raw[:4] == b"AT&T":
-        return _save_raw(raw, "djvu", "image/vnd.djvu", "djvu", url, source_page, title, job_id)
+        return _save_raw(raw, "djvu", "image/vnd.djvu", "djvu", url, source_page, title, job_id, resp=resp)
 
     try:
         im = Image.open(io.BytesIO(raw))

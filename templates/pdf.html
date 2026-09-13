@@ -38,6 +38,23 @@
   #linkQueueResult { margin-top: 8px; font-size: 0.88rem; }
   #linkQueueResult .ok { color: #16a34a; }
   #linkQueueResult .fail { color: #dc2626; }
+  .link-tabs { display: flex; gap: 0; margin: 4px 0 10px; border-bottom: 2px solid #e5e7eb; }
+  .link-tabs .tab { background: none; color: #555; border-radius: 0; padding: 8px 14px; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+  .link-tabs .tab:hover { background: #f3f4f6; }
+  .link-tabs .tab.on { color: #2563eb; border-bottom-color: #2563eb; font-weight: 600; }
+  .link-tabs .cnt { color: #888; font-weight: 400; font-size: 0.8rem; }
+  .mode-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  .mode-row[hidden] { display: none; }
+  .chip { background: #eef2ff; color: #3730a3; padding: 5px 11px; font-size: 0.82rem; border-radius: 999px; }
+  .chip:hover { background: #e0e7ff; }
+  .chip.on { background: #2563eb; color: #fff; }
+  .ext-badge { display: inline-block; min-width: 34px; text-align: center; padding: 1px 6px; border-radius: 4px; font-size: 0.72rem; font-weight: 600; background: #e5e7eb; color: #374151; text-transform: uppercase; }
+  .ext-badge.pdf { background: #fee2e2; color: #991b1b; }
+  .saved-badge { color: #16a34a; font-size: 0.78rem; white-space: nowrap; }
+  .warn-note { color: #b45309; font-size: 0.75rem; }
+  .post-of { display: block; color: #6b7280; font-size: 0.75rem; margin-top: 2px; }
+  .date-cell { white-space: nowrap; color: #555; }
+  #postFilter { flex: 1; }
 </style>
 </head>
 <body>
@@ -66,19 +83,34 @@
       <button id="linkFindBtn">링크 찾기</button>
     </div>
     <p style="color:#666; font-size:0.9rem; margin-top:0;">
-      페이지 안의 모든 링크(&lt;a href&gt;)를 뽑아서 보여줍니다. 자료실처럼 PDF/파일
-      링크가 잔뜩 있는 페이지에서 하나씩 열어보지 않고 골라서 큐에 넣을 때 씀.
+      페이지 안의 링크를 뽑아서 보여줍니다. <b>게시물 목록</b>(목록 페이지면 글 목록 — 고른 글들에 들어가 파일을 모아옴),
+      <b>파일 양식</b>(PDF·HWP·엑셀 같은 파일만, 같은 파일은 한 줄로), <b>전체</b>(모든 링크, 기존 방식),
+      <b>URL 포함</b>(입력한 문구가 주소에 들어간 링크만).
     </p>
+    <div class="link-tabs" id="linkTabs">
+      <button class="tab" data-mode="posts" id="postsTab" hidden>게시물 목록 <span class="cnt" id="cntPosts"></span></button>
+      <button class="tab on" data-mode="files">파일 양식 <span class="cnt" id="cntFiles"></span></button>
+      <button class="tab" data-mode="all">전체 <span class="cnt" id="cntAll"></span></button>
+      <button class="tab" data-mode="url">URL 포함</button>
+    </div>
+    <div class="mode-row" id="postRow" hidden>
+      <input type="text" id="postFilter" placeholder="제목·날짜로 거르기 (예: 2026, 가계부채)">
+      <button id="collectBtn">선택한 글에서 파일 모으기 <span id="postPickCount"></span></button>
+    </div>
+    <div class="mode-row" id="extRow"></div>
+    <div class="mode-row" id="urlRow" hidden>
+      <input type="text" id="urlFilter" placeholder="주소에 들어간 문구 (예: /files/, fileDown, 2026, financial-stability)">
+    </div>
     <div id="linkListMsg"></div>
     <div class="link-controls">
-      <button class="secondary small" id="linkSelectAll">전체선택</button>
+      <button class="secondary small" id="linkSelectAll">보이는 항목 전체선택</button>
       <button class="secondary small" id="linkSelectNone">선택해제</button>
       <button class="secondary small" id="linkSelectPdf">.pdf만 선택</button>
-      <button id="linkQueueBtn">선택 항목 큐에 추가</button>
+      <button id="linkQueueBtn">선택 항목 큐에 추가 <span id="pickCount"></span></button>
     </div>
-    <div class="pdf-table-wrap" style="max-height:320px;">
+    <div class="pdf-table-wrap" style="max-height:360px;">
       <table class="pdf-table">
-        <thead><tr><th style="width:28px;"></th><th>텍스트</th><th>URL</th></tr></thead>
+        <thead id="linkTableHead"></thead>
         <tbody id="linkTableBody"></tbody>
       </table>
     </div>
@@ -136,7 +168,9 @@ document.getElementById("manualBtn").onclick = async () => {
     });
     const data = await res.json();
     if (data.success) {
-      resultEl.innerHTML = `<span class="ok">완료: ${data.filename} (${data.job_id})</span>`;
+      resultEl.innerHTML = data.duplicate
+        ? `<span class="ok">이미 받은 파일입니다 — 새로 저장하지 않음: ${data.filename} (${data.job_id})</span>`
+        : `<span class="ok">완료: ${data.filename} (${data.job_id})</span>`;
       document.getElementById("manualUrl").value = "";
       loadPdfList();
     } else {
@@ -156,24 +190,244 @@ document.getElementById("manualUrl").addEventListener("keydown", e => {
 loadPdfList();
 
 // ---- 페이지에서 링크 찾기 (Link Gopher) ----
-let foundLinks = [];
+// 세 가지 보기: all(전체 링크, 기존 방식) / files(파일 양식만) / url(주소에 문구 포함).
+// 선택은 URL 기준으로 기억해서, 탭·필터를 바꿔도 체크가 유지된다.
+let foundLinks = [];   // 서버 "links" — 페이지의 모든 링크
+let foundFiles = [];   // 서버 "files" — 파일만, 같은 파일은 한 줄
+let foundPosts = [];   // 서버 "posts" — 목록 페이지일 때 글 목록 {url,title,date}
+let shownLinks = [];   // 지금 표에 보이는 행
+let linkMode = "files";
+let extFilter = "pdf";
+const picked = new Set();       // 큐에 넣을 링크/파일 URL
+const pickedPosts = new Set();  // 파일을 모아올 글 URL
+const postFileCount = new Map(); // 글 URL -> 모아온 파일 수 (-1 = 실패)
+let collecting = false;
+
+const EXT_GROUPS = [
+  { key: "pdf", label: "PDF", exts: ["pdf"] },
+  { key: "hwp", label: "HWP", exts: ["hwp", "hwpx"] },
+  { key: "excel", label: "엑셀", exts: ["xls", "xlsx", "csv"] },
+  { key: "word", label: "워드", exts: ["doc", "docx"] },
+  { key: "ppt", label: "PPT", exts: ["ppt", "pptx"] },
+  { key: "etc", label: "기타", exts: ["zip", "epub", "txt"] },
+];
+// 지금 다운로드 엔진이 파일 바이트로 알아보는 건 PDF/ZIP/EPUB뿐 — 나머지는 미리 알려준다.
+const SAVE_NOTE = {
+  hwp: "아직 저장 안 됨", doc: "아직 저장 안 됨", xls: "아직 저장 안 됨", ppt: "아직 저장 안 됨",
+  csv: "아직 저장 안 됨", txt: "아직 저장 안 됨",
+  hwpx: ".zip으로 저장됨", docx: ".zip으로 저장됨", xlsx: ".zip으로 저장됨", pptx: ".zip으로 저장됨",
+};
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function groupOf(ext) {
+  return (EXT_GROUPS.find(g => g.exts.includes(ext)) || EXT_GROUPS[EXT_GROUPS.length - 1]).key;
+}
+
+function renderExtChips() {
+  const row = document.getElementById("extRow");
+  row.hidden = linkMode !== "files";
+  const counts = {};
+  foundFiles.forEach(f => { const g = groupOf(f.ext); counts[g] = (counts[g] || 0) + 1; });
+  const chips = [{ key: "any", label: "모든 파일", n: foundFiles.length }]
+    .concat(EXT_GROUPS.filter(g => counts[g.key]).map(g => ({ key: g.key, label: g.label, n: counts[g.key] })));
+  row.innerHTML = chips.map(c =>
+    `<button class="chip ${c.key === extFilter ? "on" : ""}" data-ext="${c.key}">${c.label} ${c.n}</button>`
+  ).join("");
+}
 
 function renderLinkTable() {
-  document.getElementById("linkTableBody").innerHTML = foundLinks.map((l, i) => `
-    <tr>
-      <td><input type="checkbox" class="lpick" data-i="${i}"></td>
-      <td>${(l.text || "").slice(0, 60)}</td>
-      <td class="url-cell" title="${l.url}"><a href="${l.url}" target="_blank">${l.url}</a></td>
-    </tr>
-  `).join("");
+  document.getElementById("urlRow").hidden = linkMode !== "url";
+  document.getElementById("postRow").hidden = linkMode !== "posts";
+  document.getElementById("linkSelectPdf").hidden = linkMode !== "all";
+  document.getElementById("linkQueueBtn").hidden = linkMode === "posts";
+  renderExtChips();
+
+  const q = document.getElementById("urlFilter").value.trim().toLowerCase();
+  if (linkMode === "posts") {
+    renderPostTable();
+    return;
+  }
+  if (linkMode === "files") {
+    shownLinks = extFilter === "any" ? foundFiles : foundFiles.filter(f => groupOf(f.ext) === extFilter);
+  } else if (linkMode === "url") {
+    shownLinks = q ? foundLinks.filter(l => l.url.toLowerCase().includes(q)) : [];
+  } else {
+    shownLinks = foundLinks;
+  }
+
+  const head = document.getElementById("linkTableHead");
+  const body = document.getElementById("linkTableBody");
+  if (linkMode === "files") {
+    head.innerHTML = `<tr><th style="width:28px;"></th><th style="width:52px;">형식</th><th>이름</th><th style="width:70px;">상태</th><th>URL</th></tr>`;
+    body.innerHTML = shownLinks.map((l, i) => `
+      <tr>
+        <td><input type="checkbox" class="lpick" data-i="${i}" ${picked.has(l.url) ? "checked" : ""}></td>
+        <td><span class="ext-badge ${esc(l.ext)}">${esc(l.ext)}</span></td>
+        <td>${esc(l.text.slice(0, 90))}${SAVE_NOTE[l.ext] ? ` <span class="warn-note">(${SAVE_NOTE[l.ext]})</span>` : ""}${l.post ? `<span class="post-of">글: ${esc(l.post.slice(0, 80))}</span>` : ""}</td>
+        <td>${l.saved_as ? `<span class="saved-badge" title="${esc(l.saved_as)}">✓ 받음</span>` : ""}</td>
+        <td class="url-cell" title="${esc(l.url)}"><a href="${esc(l.url)}" target="_blank">${esc(l.url)}</a></td>
+      </tr>`).join("");
+  } else {
+    head.innerHTML = `<tr><th style="width:28px;"></th><th>텍스트</th><th>URL</th></tr>`;
+    body.innerHTML = shownLinks.map((l, i) => `
+      <tr>
+        <td><input type="checkbox" class="lpick" data-i="${i}" ${picked.has(l.url) ? "checked" : ""}></td>
+        <td>${esc((l.text || "").slice(0, 60))}</td>
+        <td class="url-cell" title="${esc(l.url)}"><a href="${esc(l.url)}" target="_blank">${esc(l.url)}</a></td>
+      </tr>`).join("");
+  }
+
+  const msg = document.getElementById("linkListMsg");
+  if (!foundLinks.length) {
+    msg.textContent = msg.dataset.base || "";
+  } else if (linkMode === "files") {
+    msg.textContent = foundFiles.length
+      ? `파일 ${shownLinks.length}개 표시 (페이지 전체 링크 ${foundLinks.length}개 중 파일 ${foundFiles.length}개)`
+      : `이 페이지에서 파일 링크를 못 찾았습니다 — [전체]나 [URL 포함]으로 직접 확인하세요.`;
+  } else if (linkMode === "url") {
+    msg.textContent = q ? `"${q}" 들어간 링크 ${shownLinks.length}개` : `주소에 들어간 문구를 입력하세요 (전체 링크 ${foundLinks.length}개에서 찾음)`;
+  } else {
+    msg.textContent = `${foundLinks.length}개 링크 찾음`;
+  }
+  updatePickCount();
 }
+
+function updatePickCount() {
+  document.getElementById("pickCount").textContent = picked.size ? `(${picked.size})` : "";
+  document.getElementById("postPickCount").textContent = pickedPosts.size ? `(${pickedPosts.size})` : "";
+}
+
+function renderPostTable() {
+  const q = document.getElementById("postFilter").value.trim().toLowerCase();
+  shownLinks = q ? foundPosts.filter(p => (p.title + " " + p.date).toLowerCase().includes(q)) : foundPosts;
+  document.getElementById("linkTableHead").innerHTML =
+    `<tr><th style="width:28px;"></th><th style="width:90px;">날짜</th><th>제목</th><th style="width:70px;">파일</th></tr>`;
+  document.getElementById("linkTableBody").innerHTML = shownLinks.map((p, i) => {
+    const n = postFileCount.get(p.url);
+    const filesCell = n === undefined ? "" : n < 0 ? `<span class="warn-note">실패</span>` : `${n}개`;
+    return `
+      <tr>
+        <td><input type="checkbox" class="ppick" data-i="${i}" ${pickedPosts.has(p.url) ? "checked" : ""}></td>
+        <td class="date-cell">${esc(p.date)}</td>
+        <td><a href="${esc(p.url)}" target="_blank">${esc(p.title.slice(0, 100))}</a></td>
+        <td>${filesCell}</td>
+      </tr>`;
+  }).join("");
+  if (!collecting) {
+    document.getElementById("linkListMsg").textContent = q
+      ? `"${q}" 들어간 글 ${shownLinks.length}개 (전체 ${foundPosts.length}개)`
+      : `글 ${foundPosts.length}개 — 받을 글을 체크하고 [선택한 글에서 파일 모으기]`;
+  }
+  updatePickCount();
+}
+
+// 파일 이름은 글 제목으로 — 사이트가 붙인 첨부 이름은 "본문.pdf", "F.pdf"처럼 제각각이라
+// 한꺼번에 받으면 뭐가 뭔지 모른다. 한 글에 같은 형식 파일이 여러 개면 "글 제목 - 첨부 이름".
+function queueTitleFor(file) {
+  if (!file.post) return file.title;
+  const siblings = foundFiles.filter(f => f.post_url === file.post_url && groupOf(f.ext) === groupOf(file.ext));
+  if (siblings.length <= 1) return file.post;
+  return `${file.post} - ${file.text.replace(/\.[a-z0-9]{2,5}$/i, "")}`;
+}
+
+document.getElementById("postFilter").addEventListener("input", renderLinkTable);
+
+document.getElementById("collectBtn").onclick = async () => {
+  if (collecting) return;
+  const targets = foundPosts.filter(p => pickedPosts.has(p.url));
+  const msg = document.getElementById("linkListMsg");
+  if (!targets.length) { msg.textContent = "파일을 모아올 글을 먼저 체크하세요."; return; }
+  collecting = true;
+  const btn = document.getElementById("collectBtn");
+  btn.disabled = true;
+  const knownUrls = new Set(foundFiles.map(f => f.url));
+  const newlyFound = [];
+  const CHUNK = 10;  // 서버 /api/links/post-files 한 번에 받는 최대 글 수
+  try {
+    for (let i = 0; i < targets.length; i += CHUNK) {
+      msg.textContent = `파일 모으는 중... ${Math.min(i, targets.length)}/${targets.length}개 글 (찾은 파일 ${newlyFound.length}개)`;
+      const chunk = targets.slice(i, i + CHUNK);
+      const byUrl = new Map(chunk.map(p => [p.url, p]));
+      let data;
+      try {
+        const res = await fetch("/api/links/post-files", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ urls: chunk.map(p => p.url) }),
+        });
+        data = await res.json();
+      } catch (e) {
+        data = { success: false };
+      }
+      if (!data.success) { chunk.forEach(p => postFileCount.set(p.url, -1)); continue; }
+      for (const r of data.results) {
+        const post = byUrl.get(r.url);
+        postFileCount.set(r.url, r.error ? -1 : r.files.length);
+        for (const f of r.files) {
+          if (knownUrls.has(f.url)) continue;
+          knownUrls.add(f.url);
+          const item = { ...f, post: post.title, post_url: post.url };
+          foundFiles.push(item);
+          newlyFound.push(item);
+        }
+      }
+    }
+  } finally {
+    collecting = false;
+    btn.disabled = false;
+  }
+  // 모아온 파일은 파일 양식 탭에서 PDF부터, 새로 찾은 PDF는 미리 체크해 둔다(이미 받은 건 제외).
+  document.getElementById("cntFiles").textContent = foundFiles.length;
+  extFilter = newlyFound.some(f => f.ext === "pdf") ? "pdf" : "any";
+  newlyFound.filter(f => (extFilter === "any" || f.ext === "pdf") && !f.saved_as).forEach(f => picked.add(f.url));
+  const failed = targets.filter(p => postFileCount.get(p.url) === -1).length;
+  linkMode = "files";
+  document.querySelectorAll("#linkTabs .tab").forEach(t => t.classList.toggle("on", t.dataset.mode === "files"));
+  renderLinkTable();
+  msg.textContent = `${targets.length}개 글에서 파일 ${newlyFound.length}개 찾음` +
+    (failed ? `, ${failed}개 글은 열지 못함` : "") +
+    ` — 새 PDF는 미리 체크해 뒀습니다. [선택 항목 큐에 추가]를 누르면 받습니다.`;
+};
+
+document.getElementById("linkTabs").addEventListener("click", e => {
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  linkMode = tab.dataset.mode;
+  document.querySelectorAll("#linkTabs .tab").forEach(t => t.classList.toggle("on", t === tab));
+  renderLinkTable();
+  if (linkMode === "url") document.getElementById("urlFilter").focus();
+});
+document.getElementById("extRow").addEventListener("click", e => {
+  const chip = e.target.closest(".chip");
+  if (!chip) return;
+  extFilter = chip.dataset.ext;
+  renderLinkTable();
+});
+document.getElementById("urlFilter").addEventListener("input", renderLinkTable);
+document.getElementById("linkTableBody").addEventListener("change", e => {
+  const cls = e.target.classList;
+  if (!cls.contains("lpick") && !cls.contains("ppick")) return;
+  const set = cls.contains("ppick") ? pickedPosts : picked;
+  const l = shownLinks[+e.target.dataset.i];
+  e.target.checked ? set.add(l.url) : set.delete(l.url);
+  updatePickCount();
+});
 
 document.getElementById("linkFindBtn").onclick = async () => {
   const url = document.getElementById("linkPageUrl").value.trim();
   if (!url) return;
   const btn = document.getElementById("linkFindBtn");
   btn.disabled = true;
-  document.getElementById("linkListMsg").textContent = "찾는 중...";
+  const msg = document.getElementById("linkListMsg");
+  msg.dataset.base = "찾는 중... (다운로드 링크는 파일인지 하나씩 확인하느라 몇 초 걸릴 수 있음)";
+  foundLinks = []; foundFiles = []; foundPosts = [];
+  picked.clear(); pickedPosts.clear(); postFileCount.clear();
+  document.getElementById("postsTab").hidden = true;
+  // 이전 검색의 개수가 실패한 새 검색 옆에 남지 않게
+  ["cntAll", "cntFiles", "cntPosts"].forEach(id => { document.getElementById(id).textContent = ""; });
+  renderLinkTable();
   document.getElementById("linkQueueResult").textContent = "";
   try {
     const res = await fetch("/api/links/extract", {
@@ -183,15 +437,26 @@ document.getElementById("linkFindBtn").onclick = async () => {
     });
     const data = await res.json();
     if (!data.success) {
-      document.getElementById("linkListMsg").textContent = "실패: " + data.error;
-      foundLinks = [];
+      msg.dataset.base = "실패: " + data.error;
     } else {
       foundLinks = data.links;
-      document.getElementById("linkListMsg").textContent = `${foundLinks.length}개 링크 찾음`;
+      foundFiles = data.files || [];
+      foundPosts = data.posts || [];
+      msg.dataset.base = "";
+      // 파일 양식 탭은 PDF가 있으면 PDF부터, 없으면 모든 파일
+      extFilter = foundFiles.some(f => f.ext === "pdf") ? "pdf" : "any";
+      document.getElementById("cntAll").textContent = foundLinks.length;
+      document.getElementById("cntFiles").textContent = foundFiles.length;
+      document.getElementById("cntPosts").textContent = foundPosts.length;
+      document.getElementById("postsTab").hidden = !foundPosts.length;
+      // 목록 페이지인데 페이지 자체엔 파일이 없으면(이슈노트 목록 같은 경우) 글 목록부터 보여준다.
+      linkMode = foundPosts.length && !foundFiles.length ? "posts" : (linkMode === "posts" ? "files" : linkMode);
+      document.querySelectorAll("#linkTabs .tab").forEach(t => t.classList.toggle("on", t.dataset.mode === linkMode));
     }
     renderLinkTable();
   } catch (e) {
-    document.getElementById("linkListMsg").textContent = "요청 실패: " + e;
+    msg.dataset.base = "요청 실패: " + e;
+    renderLinkTable();
   } finally {
     btn.disabled = false;
   }
@@ -201,37 +466,54 @@ document.getElementById("linkPageUrl").addEventListener("keydown", e => {
 });
 
 document.getElementById("linkSelectAll").onclick = () => {
-  document.querySelectorAll(".lpick").forEach(cb => cb.checked = true);
+  const set = linkMode === "posts" ? pickedPosts : picked;
+  shownLinks.forEach(l => set.add(l.url));
+  renderLinkTable();
 };
 document.getElementById("linkSelectNone").onclick = () => {
-  document.querySelectorAll(".lpick").forEach(cb => cb.checked = false);
+  (linkMode === "posts" ? pickedPosts : picked).clear();
+  renderLinkTable();
 };
+// 주소 전체가 아니라 경로(pathname)만 본다 — PDF 뷰어 페이지
+// (viewer.html?file=...pdf)처럼 쿼리 끝에만 .pdf가 붙은 링크는 PDF 파일이
+// 아니라 웹페이지라서 큐에 넣으면 "이미지를 찾지 못했습니다"로 실패한다.
+// 서버 쪽 scrape.find_pdf_links()와 같은 기준.
+function isPdfPath(url) {
+  try { return new URL(url).pathname.toLowerCase().endsWith(".pdf"); }
+  catch (e) { return false; }
+}
 document.getElementById("linkSelectPdf").onclick = () => {
-  document.querySelectorAll(".lpick").forEach(cb => {
-    cb.checked = /\.pdf(\?|#|$)/i.test(foundLinks[+cb.dataset.i].url);
-  });
+  picked.clear();
+  foundLinks.filter(l => isPdfPath(l.url)).forEach(l => picked.add(l.url));
+  renderLinkTable();
 };
 
 document.getElementById("linkQueueBtn").onclick = async () => {
-  const picked = [...document.querySelectorAll(".lpick:checked")].map(cb => foundLinks[+cb.dataset.i]);
+  // 파일 양식 탭에서 정리된 이름(title)이 있으면 그걸 쓰고, 없으면 기존처럼 링크 글자.
+  const fileByUrl = new Map(foundFiles.map(f => [f.url, f]));
+  const linkByUrl = new Map(foundLinks.map(l => [l.url, l]));
+  const pickedLinks = [...picked].map(u => {
+    const f = fileByUrl.get(u);
+    return f ? { url: u, title: queueTitleFor(f), source_page: f.post_url } : { url: u, title: (linkByUrl.get(u) || {}).text || "" };
+  });
   const resultEl = document.getElementById("linkQueueResult");
-  if (picked.length === 0) { resultEl.innerHTML = `<span class="fail">선택된 링크가 없습니다.</span>`; return; }
+  if (pickedLinks.length === 0) { resultEl.innerHTML = `<span class="fail">선택된 링크가 없습니다.</span>`; return; }
 
   const pageUrl = document.getElementById("linkPageUrl").value.trim();
   const folder = document.getElementById("linkFolder").value.trim();
   const btn = document.getElementById("linkQueueBtn");
   btn.disabled = true;
-  resultEl.textContent = `${picked.length}개 큐에 추가하는 중...`;
+  resultEl.textContent = `${pickedLinks.length}개 큐에 추가하는 중...`;
   try {
     const res = await fetch("/api/submissions/add", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        submissions: picked.map(l => ({ url: l.url, title: l.text, folder, source_page: pageUrl })),
+        submissions: pickedLinks.map(l => ({ url: l.url, title: l.title, folder, source_page: l.source_page || pageUrl })),
       }),
     });
     const data = await res.json();
-    if (!data.success) { resultEl.innerHTML = `<span class="fail">실패: ${data.error}</span>`; return; }
+    if (!data.success) { resultEl.innerHTML = `<span class="fail">실패: ${esc(data.error)}</span>`; return; }
     resultEl.innerHTML = `<span class="ok">${data.added}개 큐에 추가함 — 지금 처리 중...</span>`;
     // 매 10초 자동 감시를 기다리지 않고 바로 한 번 처리 — 워커가 정지 상태여도
     // "지금 처리"와 동일하게 즉시 한 번은 돌려줌.

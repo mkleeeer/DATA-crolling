@@ -3,6 +3,7 @@ import re
 import threading
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -13,12 +14,16 @@ import db
 import download_worker
 import drive
 import extractor_worker
+import listing
 import net
 import pipeline
 import settings
 import sheets
 from queue_config import POLL_SECONDS, SPREADSHEET_ID, SPREADSHEET_URL
-from scrape import extract_images_from_html, extract_links_from_html, filter_navigation_links
+from scrape import (
+    extract_file_links, extract_images_from_html, extract_links_from_html, file_ext_of, file_name_key,
+    filter_navigation_links,
+)
 
 app = Flask(__name__)
 db.init_db()
@@ -240,19 +245,128 @@ def api_pdfs_recent():
 @app.route("/api/links/extract", methods=["POST"])
 def api_links_extract():
     """"Link Gopher" style bulk-link listing — fetch a page and return every
-    <a href> on it, so a resource/index page's file links can be picked out
-    without opening each one."""
+    <a href> on it ("links", the original full list), plus just the document
+    files among them ("files", deduplicated, with a format and a readable
+    name), so a resource page's files can be picked without opening each."""
     data = request.get_json(force=True) or {}
     url = (data.get("url") or "").strip()
     if not url:
         return jsonify({"success": False, "error": "url이 필요합니다."}), 400
     try:
         resp = net.fetch_page(url)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"페이지를 가져오지 못했습니다: {e}"}), 502
+    if resp.status_code == 403:
+        # Whole-site bot protection (Akamai, Cloudflare, ...) answers every
+        # non-browser request this way — say so plainly instead of a bare
+        # "403 Client Error", so it isn't mistaken for a bug in this app.
+        server = resp.headers.get("Server", "")
+        return jsonify({"success": False, "error": (
+            f"403 접근 거부 — 이 사이트가 브라우저가 아닌 프로그램의 접근을 막고 있습니다"
+            f"{f' (보안 서버: {server})' if server else ''}. 이 앱으로는 이 사이트의 페이지와 파일을 가져올 수 없습니다."
+        )}), 502
+    try:
         resp.raise_for_status()
     except Exception as e:
         return jsonify({"success": False, "error": f"페이지를 가져오지 못했습니다: {e}"}), 502
     links = filter_navigation_links(extract_links_from_html(resp.text, resp.url))
-    return jsonify({"success": True, "links": links, "total": len(links)})
+    files, unprobed = _files_on_page(resp.text, resp.url)
+    # A board list page: its files sit one level down on each post — hand
+    # back the post list so the UI can gather files from the chosen posts.
+    posts, posts_source = listing.find_posts(resp.text, resp.url)
+
+    return jsonify({
+        "success": True, "links": links, "total": len(links),
+        "files": files, "unprobed": unprobed,
+        "posts": posts, "posts_source": posts_source,
+    })
+
+
+# One request's worth of posts — the UI sends a long post list in chunks
+# so it can show progress and no single request runs for minutes.
+_MAX_POSTS_PER_REQUEST = 10
+
+
+@app.route("/api/links/post-files", methods=["POST"])
+def api_links_post_files():
+    """Open each given post page and return the files on it:
+    {"results": [{"url", "files": [...], "error"}]} in the same order."""
+    data = request.get_json(force=True) or {}
+    urls = [u.strip() for u in (data.get("urls") or []) if isinstance(u, str) and u.strip()]
+    if not urls:
+        return jsonify({"success": False, "error": "urls가 필요합니다."}), 400
+    if len(urls) > _MAX_POSTS_PER_REQUEST:
+        return jsonify({"success": False, "error": f"한 번에 최대 {_MAX_POSTS_PER_REQUEST}개까지입니다."}), 400
+
+    def one(post_url):
+        try:
+            page = net.fetch_page(post_url)
+            page.raise_for_status()
+            files, _ = _files_on_page(page.text, page.url)
+            return {"url": post_url, "files": files, "error": ""}
+        except Exception as e:
+            return {"url": post_url, "files": [], "error": str(e)[:200]}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(one, urls))
+    return jsonify({"success": True, "results": results})
+
+
+def _files_on_page(html: str, page_url: str):
+    """(document files on the page, how many download links went unchecked)."""
+    files, unverified = extract_file_links(html, page_url)
+    # Download-script links (FileDown.do?..., download?atch_no=...) don't say
+    # what they are — peek at each one's first bytes to find out. Capped so a
+    # page full of download links can't stall the request.
+    # The same document is often linked twice through different URLs (a
+    # "/files/x.pdf" link and a "fileDown.do?..." link) — once the server
+    # tells us the probed file's name, drop it if that name is already listed.
+    to_probe = unverified[:_MAX_LINK_PROBES]
+    known_names = {file_name_key(f["title"] or f["text"]) for f in files}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for item, (ext, server_name) in zip(to_probe, pool.map(_probe_file, [i["url"] for i in to_probe])):
+            if not ext:
+                continue
+            item["ext"] = ext
+            if server_name and not item["title"]:
+                item["text"] = server_name
+            key = file_name_key(item["title"] or item["text"])
+            if key in known_names:
+                continue
+            known_names.add(key)
+            files.append(item)
+    for item in files:
+        saved = pipeline.find_saved_by_url(item["url"])
+        item["saved_as"] = saved["local_path"] if saved else ""
+    return files, max(len(unverified) - _MAX_LINK_PROBES, 0)
+
+
+_MAX_LINK_PROBES = 20
+
+
+def _probe_file(url: str):
+    """(document extension or "" if it's not a file, the filename the server
+    gives it) — reads only the first KB, never the whole file. The bytes
+    decide PDF; for other formats the server's filename says which one, as
+    long as the body isn't an HTML page."""
+    try:
+        resp = net.fetch_page(url, stream=True)
+    except Exception:
+        return "", None
+    try:
+        if resp.status_code >= 400:
+            return "", None
+        head = next(resp.iter_content(chunk_size=1024), b"")
+        server_name = pipeline.content_disposition_name(resp)
+        if head.startswith(b"%PDF-"):
+            return "pdf", server_name
+        if head.lstrip()[:1] == b"<":
+            return "", None
+        return file_ext_of(server_name), server_name
+    except Exception:
+        return "", None
+    finally:
+        resp.close()
 
 
 @app.route("/api/submissions/add", methods=["POST"])

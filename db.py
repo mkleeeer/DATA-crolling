@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS images (
     created_at TEXT NOT NULL,
     drive_file_id TEXT,
     drive_url TEXT,
+    sha256 TEXT,
     FOREIGN KEY (job_id) REFERENCES jobs (id)
 );
 """
@@ -43,6 +44,12 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # registry.db files created before the sha256 column existed need it
+        # added in place — CREATE TABLE IF NOT EXISTS won't touch them.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(images)")}
+        if "sha256" not in columns:
+            conn.execute("ALTER TABLE images ADD COLUMN sha256 TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images (sha256)")
 
 
 def slugify(text: str) -> str:
@@ -81,11 +88,47 @@ def insert_image(record: dict) -> None:
         conn.execute(
             """INSERT INTO images
                (id, job_id, seq, filename, local_path, original_path, source_url, source_page,
-                title, caption, mime_type, width, height, created_at, drive_file_id, drive_url)
+                title, caption, mime_type, width, height, created_at, drive_file_id, drive_url, sha256)
                VALUES (:id, :job_id, :seq, :filename, :local_path, :original_path, :source_url, :source_page,
-                       :title, :caption, :mime_type, :width, :height, :created_at, :drive_file_id, :drive_url)""",
-            record,
+                       :title, :caption, :mime_type, :width, :height, :created_at, :drive_file_id, :drive_url, :sha256)""",
+            {"sha256": None, **record},
         )
+
+
+# Records saved through the raw-file path (PDF/EPUB/ZIP/DjVu) — every id
+# prefix except the image pipeline's "img_".
+_RAW_RECORD_FILTER = "id NOT LIKE 'img\\_%' ESCAPE '\\'"
+
+
+def find_raw_by_source_url(url: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM images WHERE source_url = ? AND {_RAW_RECORD_FILTER} ORDER BY created_at ASC",
+            (url,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_raw_by_sha256(sha256: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM images WHERE sha256 = ? AND {_RAW_RECORD_FILTER} ORDER BY created_at ASC",
+            (sha256,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_raw_missing_sha256() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM images WHERE sha256 IS NULL AND {_RAW_RECORD_FILTER}"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_sha256(image_id: str, sha256: str) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE images SET sha256 = ? WHERE id = ?", (sha256, image_id))
 
 
 def update_image_drive(image_id: str, drive_file_id: str, drive_url: str) -> None:

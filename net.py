@@ -128,11 +128,18 @@ def fetch_image(image_url: str, page_url: str = "", stream: bool = False, cookie
     return resp
 
 
-def fetch_page(url: str):
+def fetch_page(url: str, stream: bool = False):
+    """stream=True returns as soon as headers arrive, so a caller that only
+    needs to know *what* the URL is (e.g. a 50MB PDF vs. an HTML page) can
+    decide without pulling the whole body — the caller must close it."""
     assert_public_url(url)
     with fetch_limiter:
-        resp = _session().get(url, headers=BROWSER_HEADERS, timeout=15)
-    assert_public_url(resp.url)
+        resp = _session().get(url, headers=BROWSER_HEADERS, timeout=15, stream=stream)
+    try:
+        assert_public_url(resp.url)
+    except BlockedURLError:
+        resp.close()
+        raise
     return resp
 
 
