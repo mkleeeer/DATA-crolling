@@ -22,7 +22,7 @@ import resolver
 from scrape import is_generic_link_text
 
 BASE_DIR = Path(__file__).parent
-DOWNLOADS_DIR = Path(r"G:\내 드라이브\[작업공간]\웹이미지 수집")
+DOWNLOADS_DIR = Path(r"G:\내 드라이브\0\_받는함\크롤러")
 KEEP_ORIGINAL = os.environ.get("IMAGE_KEEP_ORIGINAL", "1") != "0"
 
 # Formats Pillow can decode. Anything outside this set (or that fails to
