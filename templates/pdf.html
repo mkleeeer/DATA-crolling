@@ -68,7 +68,8 @@
     <div class="link-controls"><button id="googleConnectBtn">Google 연결</button><span id="googleAuthStatus" role="status"></span></div>
     <p><a href="{{ pdf_sheet_url }}" target="_blank" rel="noopener">PDF 전용 시트 열기 ↗</a> · <strong>A열에 URL을 한 줄씩 입력</strong>하면 자동으로 받습니다.</p>
     <p>이 컴퓨터에서 앱이 실행되는 동안 10초 간격으로 확인합니다. 저장 폴더 기본값은 PDF이며, 완료 후 시트에 파일명·저장 경로가 표시됩니다.</p>
-    <textarea id="queueUrls" rows="4" aria-label="PDF 시트에 추가할 URL" placeholder="여기서도 여러 URL을 한 줄에 하나씩 붙여넣을 수 있습니다."></textarea>
+    <textarea id="queueUrls" rows="4" aria-label="PDF 시트에 추가할 URL" placeholder="URL이 들어 있는 내용을 통째로 붙여넣으세요. 설명·번호·표·마크다운이 섞여 있어도 주소만 골라 등록합니다."></textarea>
+    <p>http:// · https:// 주소만 추출하며, 같은 입력 안의 중복 주소는 한 번만 등록합니다. 한 번에 최대 200개입니다.</p>
     <div class="link-controls">
       <input type="text" id="queueFolder" aria-label="PDF 저장 폴더" placeholder="폴더명 (기본: PDF)">
       <button id="queueAddBtn">PDF 시트에 추가</button>
@@ -254,18 +255,18 @@ document.getElementById('queueStartBtn').onclick = () => setQueueRunning('start'
 document.getElementById('queueStopBtn').onclick = () => setQueueRunning('stop');
 document.getElementById('queueAddBtn').onclick = async () => {
   const input = document.getElementById('queueUrls');
-  const urls = input.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const text = input.value;
   const result = document.getElementById('queueResult');
-  if (!urls.length) { result.textContent = 'URL을 입력하세요.'; return; }
+  if (!text.trim()) { result.textContent = 'URL이 포함된 내용을 붙여넣으세요.'; return; }
   const btn = document.getElementById('queueAddBtn');
   btn.disabled = true;
   try {
     const res = await fetch('/api/pdf-queue/add', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({urls, folder: document.getElementById('queueFolder').value.trim()})});
+      body: JSON.stringify({text, folder: document.getElementById('queueFolder').value.trim()})});
     const data = await res.json();
     if (!data.success) throw new Error(data.error);
-    input.value = '';
-    result.textContent = `${data.added}개를 PDF 시트에 추가했습니다. ${queueRunning ? '차례로 자동 다운로드합니다.' : '자동 실행을 눌러주세요.'}`;
+    if (input.value === text) input.value = '';
+    result.textContent = `URL ${data.added}개를 추출해 PDF 시트에 추가했습니다. ${queueRunning ? '차례로 자동 다운로드합니다.' : '자동 실행을 눌러주세요.'}`;
     await loadQueueStatus();
   } catch (e) { result.textContent = '추가 실패: ' + e; }
   finally { btn.disabled = false; }

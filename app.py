@@ -21,6 +21,7 @@ import pipeline
 import pdf_worker
 import settings
 import sheets
+from url_input import extract_urls
 from queue_config import POLL_SECONDS, SPREADSHEET_ID, SPREADSHEET_URL, PDF_SHEET_NAME, PDF_SHEET_URL
 from scrape import (
     extract_file_links, extract_images_from_html, extract_links_from_html, file_ext_of, file_name_key,
@@ -268,6 +269,14 @@ def api_google_auth_start():
 def api_pdf_queue_add():
     data = request.get_json(force=True) or {}
     items = data.get("submissions")
+    if "text" in data:
+        text = data["text"]
+        if not isinstance(text, str) or len(text) > 1_000_000:
+            return jsonify({"success": False, "error": "붙여넣을 텍스트는 100만 자 이하로 입력하세요."}), 400
+        urls = extract_urls(text)
+        if not urls:
+            return jsonify({"success": False, "error": "텍스트에서 유효한 http:// 또는 https:// URL을 찾지 못했습니다."}), 400
+        items = [{"url": url, "folder": data.get("folder") or "PDF"} for url in urls]
     if items is None:
         urls = data.get("urls")
         items = [{"url": value, "folder": data.get("folder") or "PDF"} for value in urls] if isinstance(urls, list) else []
