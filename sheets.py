@@ -1,7 +1,6 @@
 import threading
 import time
 
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 import drive
@@ -43,7 +42,7 @@ _MAX_BACKOFF_SECONDS = 30
 
 def get_service():
     if getattr(_local, "service", None) is None:
-        _local.service = build("sheets", "v4", credentials=drive.get_credentials())
+        _local.service = drive.build_service("sheets", "v4")
     return _local.service
 
 

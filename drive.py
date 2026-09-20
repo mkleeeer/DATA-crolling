@@ -1,11 +1,12 @@
 from pathlib import Path
 import threading
 
-from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+import google_auth_httplib2
+from google_transport import configure_oauth, make_http
 
 BASE_DIR = Path(__file__).parent
 CLIENT_SECRET_FILE = BASE_DIR / "client_secret.json"
@@ -47,10 +48,14 @@ def start_authorization():
                 if not CLIENT_SECRET_FILE.exists():
                     raise DriveNotConfigured("client_secret.json이 없습니다. 앱 폴더에 Google OAuth 설정 파일을 넣어주세요.")
                 flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET_FILE), SCOPES)
-                creds = flow.run_local_server(port=0, timeout_seconds=120)
+                configure_oauth(flow.oauth2session)
+                creds = flow.run_local_server(
+                    port=0, timeout_seconds=120, authorization_prompt_message=None,
+                    success_message='Google approval received. Return to the PDF app to check the final connection status. You may close this window.')
                 TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
-        except Exception:
-            error = "Google 인증을 완료하지 못했습니다. 연결 버튼을 눌러 다시 승인해주세요."
+        except Exception as exc:
+            # Exception messages can contain authorization codes or tokens.
+            error = f"Google 인증 실패 ({type(exc).__name__}). 연결 버튼을 눌러 다시 승인해주세요."
         finally:
             with _auth_state_lock:
                 _auth_state.update(running=False, error=error)
@@ -79,7 +84,7 @@ def _load_credentials() -> Credentials:
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            creds.refresh(google_auth_httplib2.Request(make_http()))
         else:
             raise DriveNotConfigured("Google 계정 연결이 필요합니다. PDF 화면의 Google 연결 버튼을 눌러주세요.")
         TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
@@ -88,7 +93,12 @@ def _load_credentials() -> Credentials:
 
 
 def get_service():
-    return build("drive", "v3", credentials=get_credentials())
+    return build_service("drive", "v3")
+
+
+def build_service(name, version):
+    http = google_auth_httplib2.AuthorizedHttp(get_credentials(), http=make_http())
+    return build(name, version, http=http)
 
 
 def get_or_create_folder(name: str, parent_id: str | None = None) -> str:
