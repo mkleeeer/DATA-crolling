@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from urllib.parse import urljoin, urlparse
 
 import requests
+import tls_fallback
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -64,7 +65,7 @@ BROWSER_HEADERS = {
 
 def _new_session(retry_requests: bool = True) -> requests.Session:
     s = requests.Session()
-    retry = (Retry(total=4, backoff_factor=0.8, status_forcelist=[429, 500, 502, 503, 504])
+    retry = (Retry(total=4, other=0, backoff_factor=0.8, status_forcelist=[429, 500, 502, 503, 504])
              if retry_requests else Retry(total=0, raise_on_status=False))
     adapter = HTTPAdapter(max_retries=retry, pool_maxsize=10, pool_connections=10)
     s.mount("http://", adapter)
@@ -130,11 +131,16 @@ def fetch_image(image_url: str, page_url: str = "", stream: bool = False, cookie
         assert_public_url(target)
         with fetch_limiter:
             with (_limiter_for(target) or nullcontext()):
-                resp = _session(retry_requests).get(
-                    target, headers=image_headers(target, referer), timeout=15,
-                    stream=stream, cookies=cookies if origin(target) == origin(image_url) else None,
-                    allow_redirects=False,
-                )
+                request_headers = image_headers(target, referer)
+                request_cookies = cookies if origin(target) == origin(image_url) else None
+                try:
+                    resp = _session(retry_requests).get(
+                        target, headers=request_headers, timeout=15,
+                        stream=stream, cookies=request_cookies, allow_redirects=False,
+                    )
+                except requests.exceptions.SSLError:
+                    print('[net] Python TLS failed; trying Windows HTTPS transport', flush=True)
+                    resp = tls_fallback.fetch(target, request_headers, request_cookies)
         assert_public_url(resp.url)
         if resp.status_code not in {301, 302, 303, 307, 308} or not resp.headers.get("Location"):
             resp.history = history

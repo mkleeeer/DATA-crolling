@@ -1,5 +1,22 @@
 # Development log
 
+## 2026-09-20 — Windows HTTPS fallback for reproducible Python SSL EOF
+
+- Both existing urllib3 2.7.0 and new 2.8.0 environments reproduced SSL EOF
+  against the reported CDN. Windows curl/Schannel returned an HTTP response.
+- Added a Windows system-curl fallback on SSLError in the shared file/mirror
+  transport. Certificate verification remains enabled. Curl does not follow
+  redirects: the existing public-address checks still gate each next request.
+  HTTP denials do not trigger this fallback. Explicit headers/cookies are
+  preserved under the existing origin rules; temporary files are cleaned up.
+- Disabled repeated adapter retries for the SSL/other error category so the
+  fallback can run after the first Python TLS failure. Other retry policies
+  are retained. Python TLS failure can still take time before fallback begins.
+- A live fallback request retrieved a 9,840,093-byte PDF with the expected MD5.
+  Temporary URL keys and document metadata are deliberately not recorded here.
+- Validation: 37 Python tests and three JavaScript click scenarios pass,
+  including fallback headers/cookies, blocked redirects and no HTTP-error fallback.
+
 ## 2026-09-20 — Repair integrated UI and authentication flow
 
 - Fixed the missing `pageUrl` in the link-selection click handler, which
