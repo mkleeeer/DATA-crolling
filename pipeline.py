@@ -1,13 +1,14 @@
 import hashlib
 import io
+import json
 import os
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 from PIL import Image
 
 try:
@@ -17,7 +18,8 @@ except ImportError:
 
 import db
 import net
-from scrape import find_pdf_links, is_generic_link_text
+import resolver
+from scrape import is_generic_link_text
 
 BASE_DIR = Path(__file__).parent
 DOWNLOADS_DIR = Path(r"G:\내 드라이브\[작업공간]\웹이미지 수집")
@@ -228,14 +230,67 @@ def _log_fetch_failure(url: str, reason: str, resp=None) -> None:
     print(f"[pipeline] fetch failed: {reason} | url={url} final_url={final_url} status={status} content-type={ctype}")
 
 
-def _fetch_url(url: str, cookies: dict | None = None):
+def _diagnose_unknown_response(raw: bytes, url: str, resp, decode_error: Exception) -> str:
+    """Preserve evidence before reporting an unrecognized response.
+
+    Samples use escaped JSON so control characters cannot corrupt terminal
+    output. The .bin contains the entire response.content, without conversion
+    (requests may already have decompressed HTTP Content-Encoding).
+    """
+    sample = raw[:512]
+    details = {
+        "url": url,
+        "final_url": resp.url,
+        "status": resp.status_code,
+        "headers": {name: resp.headers.get(name, "") for name in (
+            "Content-Type", "Content-Length", "Content-Disposition",
+            "Content-Encoding", "Transfer-Encoding", "Server",
+        )},
+        "redirects": [{"url": hop.url, "status": hop.status_code}
+                      for hop in resp.history],
+        "body_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "decoder_error": type(decode_error).__name__,
+        "sample_bytes": len(sample),
+        "sample_hex": sample.hex(),
+        "sample_utf8": sample.decode("utf-8", errors="replace"),
+        "sample_latin1": sample.decode("latin-1"),
+    }
+    # Print evidence even if the filesystem is full/unwritable.
+    print("[pipeline] UNKNOWN_BINARY diagnostics: " + json.dumps(details, ensure_ascii=True), flush=True)
+    if os.environ.get("UNKNOWN_BINARY_SAVE_RAW", "1") == "0":
+        print("[pipeline] UNKNOWN_BINARY raw saving disabled", flush=True)
+        return "원본 임시 저장 꺼짐 (UNKNOWN_BINARY_SAVE_RAW=0)"
+
+    try:
+        configured_dir = os.environ.get("UNKNOWN_BINARY_DIAGNOSTICS_DIR")
+        diagnostic_dir = (Path(configured_dir) if configured_dir else
+                          Path(tempfile.gettempdir()) / "image-crawler-diagnostics")
+        diagnostic_dir.mkdir(parents=True, exist_ok=True)
+        # Exclusive unique names keep concurrent workers/retries from overwriting evidence.
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix="unknown-", suffix=".bin", dir=diagnostic_dir, delete=False,
+        ) as output:
+            output.write(raw)
+            saved_path = str(Path(output.name).resolve())
+    except OSError as exc:
+        print("[pipeline] UNKNOWN_BINARY raw save failed: " +
+              json.dumps({"error": str(exc)}, ensure_ascii=True), flush=True)
+        return "원본 임시 저장 실패 (진단 로그 확인)"
+
+    print("[pipeline] UNKNOWN_BINARY raw saved: " +
+          json.dumps({"path": saved_path, "body_bytes": len(raw)}, ensure_ascii=True), flush=True)
+    return f"원본 임시 저장: {saved_path}"
+
+
+def _fetch_url(url: str, cookies: dict | None = None, page_url: str = "", retry_requests: bool = True):
     """Fetch with error types kept distinguishable (URL/DNS, blocked
     internal target, timeout, specific HTTP status, connection failure)
     instead of collapsing everything into one generic "download failed" —
     matters both for the failure-breakdown view (buckets by these exact
     messages) and for telling a real block apart from a transient blip."""
     try:
-        resp = net.fetch_image(url, url, cookies=cookies)
+        resp = net.fetch_image(url, page_url or url, cookies=cookies, retry_requests=retry_requests)
     except net.BlockedURLError as e:
         _log_fetch_failure(url, "blocked (SSRF guard)")
         raise DownloadError(str(e)) from e
@@ -269,44 +324,9 @@ def _fetch_url(url: str, cookies: dict | None = None):
     return resp
 
 
-def _resolve_pdf_from_html(raw: bytes, page_url: str):
-    """A URL can turn out to be an HTML landing/redirect page instead of the
-    file itself (a "click here to download" page) — same idea as a download
-    manager resolving a link before fetching it. Look for a direct .pdf link
-    on that page and follow it, trying candidates in order until one
-    actually verifies as a PDF by magic bytes (not just by extension).
-    Returns (raw_bytes, resolved_url, response, link_text) or all None if
-    nothing panned out — link_text is what the page called that file, kept
-    so it can become the saved filename."""
-    try:
-        soup = BeautifulSoup(raw, "html.parser")
-    except Exception:
-        return None, None, None, None
-    for candidate in find_pdf_links(soup, page_url):
-        try:
-            resp = _fetch_url(candidate)
-        except DownloadError:
-            continue
-        if resp.content[:5] == b"%PDF-":
-            return resp.content, candidate, resp, _link_text_for(soup, page_url, candidate)
-    return None, None, None, None
-
-
-def _link_text_for(soup: BeautifulSoup, page_url: str, target_url: str) -> str | None:
-    """A page often links the same file several times ("보고서.pdf",
-    "다운로드", "뷰어") — take the first label that actually names it."""
-    for a in soup.find_all("a", href=True):
-        if urljoin(page_url, a["href"].strip()) != target_url:
-            continue
-        for label in (a.get("title"), a.get_text(strip=True)):
-            if _clean_stem(label, "pdf"):
-                return label
-    return None
-
-
 def download_and_process(
     url: str, source_page: str = "", title: str = "", folder: str = "",
-    cookies: dict | None = None,
+    cookies: dict | None = None, expected_md5: str = "",
 ) -> dict:
     """cookies: only ever what a caller explicitly hands in (e.g. the user's
     own already-logged-in session for a site) — never derived, stored, or
@@ -314,11 +334,27 @@ def download_and_process(
     if not url:
         raise DownloadError("url이 필요합니다.")
 
-    # Exact same URL already saved as a file (PDF/EPUB/ZIP/DjVu) that still
-    # exists on disk — skip the network entirely. Different URLs pointing at
-    # the same file are caught later by content hash in _save_raw().
+    try:
+        expected_md5 = resolver.normalize_md5(expected_md5)
+        url_checksum = resolver.url_md5(url)
+        if expected_md5 and url_checksum and expected_md5 != url_checksum:
+            raise resolver.ResolutionError("입력 MD5와 URL의 MD5가 다릅니다.")
+    except resolver.ResolutionError as exc:
+        raise DownloadError(str(exc)) from exc
+
+    # Exact same URL already saved as a file that still exists on disk: skip
+    # the network. When a checksum was supplied, verify the saved bytes first.
     existing = find_saved_by_url(url)
     if existing is not None:
+        checksum = expected_md5 or url_checksum
+        if checksum:
+            actual_md5 = hashlib.md5(
+                (DOWNLOADS_DIR / existing["local_path"]).read_bytes(), usedforsecurity=False,
+            ).hexdigest()
+            if actual_md5 != checksum:
+                raise DownloadError(f"MD5_MISMATCH: expected={checksum}, actual={actual_md5}, url={url}")
+            return {**_as_duplicate(existing), "requested_url": url, "resolved_url": url,
+                    "md5": actual_md5, "md5_verified": True}
         return _as_duplicate(existing)
 
     job_id = db.get_or_create_job(folder)
@@ -331,25 +367,34 @@ def download_and_process(
         f"content-disposition={resp.headers.get('Content-Disposition', '-')}"
     )
 
+    requested_url = url
+    resolution = {}
+    if resolver.is_file(raw) or resolver.is_html(raw, content_type):
+        try:
+            # Caller cookies belong to the initial request; never forward a
+            # caller's cookie dict to a newly discovered mirror host.
+            resp, actual_md5, checked_md5 = resolver.resolve(
+                resp, url, lambda target, parent: _fetch_url(target, page_url=parent, retry_requests=False),
+                _diagnose_unknown_response, expected_md5=expected_md5,
+            )
+        except resolver.ResolutionError as exc:
+            raise DownloadError(str(exc)) from exc
+        raw = resp.content
+        content_type = resp.headers.get("Content-Type", "")
+        url = resp.url
+        if url != requested_url:
+            source_page = source_page or requested_url
+        resolution = {"requested_url": requested_url, "resolved_url": url,
+                      "md5": actual_md5, "md5_verified": bool(checked_md5)}
+
+    def resolved_record(record):
+        return {**record, **resolution}
+
     # PDF check comes first and by magic bytes, not Content-Type header — same
     # "never trust the header" reasoning as the image path below (a blocked
     # request can come back as an HTML page with an image/pdf Content-Type).
     if raw[:5] == b"%PDF-":
-        return _save_pdf(raw, url, source_page, title, job_id, resp=resp)
-
-    looks_like_html = content_type.startswith("text/html") or raw.lstrip()[:15].lower().startswith(b"<!doctype html") or raw.lstrip()[:5].lower() == b"<html"
-    if looks_like_html:
-        resolved_raw, resolved_url, resolved_resp, link_text = _resolve_pdf_from_html(raw, resp.url)
-        if resolved_raw is not None:
-            return _save_pdf(
-                resolved_raw, resolved_url, source_page or url, title, job_id,
-                resp=resolved_resp, link_text=link_text,
-            )
-        # A real image URL never comes back as an HTML document, so there's
-        # no point handing this to Pillow — it's an HTML page (login wall,
-        # error page, a landing page with no findable PDF link), not a file.
-        _log_fetch_failure(url, "html response, no downloadable file found", resp)
-        raise DownloadError(f"HTML 응답입니다 (다운로드 대상 파일 아님, Content-Type: {content_type or 'text/html'}): {resp.url}")
+        return resolved_record(_save_pdf(raw, url, source_page, title, job_id, resp=resp))
 
     # ZIP-family and DjVu signatures, checked the same way as PDF above —
     # by the actual bytes, never by Content-Type (a generic file server
@@ -359,26 +404,23 @@ def download_and_process(
     # confusing "cannot identify image file" error).
     if raw[:4] == b"PK\x03\x04" or raw[:4] == b"PK\x05\x06":
         if _looks_like_epub(raw):
-            return _save_raw(raw, "epub", "application/epub+zip", "epub", url, source_page, title, job_id, resp=resp)
-        return _save_raw(raw, "zip", "application/zip", "zip", url, source_page, title, job_id, resp=resp)
+            return resolved_record(_save_raw(raw, "epub", "application/epub+zip", "epub", url, source_page, title, job_id, resp=resp))
+        return resolved_record(_save_raw(raw, "zip", "application/zip", "zip", url, source_page, title, job_id, resp=resp))
     if raw[:4] == b"AT&T":
-        return _save_raw(raw, "djvu", "image/vnd.djvu", "djvu", url, source_page, title, job_id, resp=resp)
+        return resolved_record(_save_raw(raw, "djvu", "image/vnd.djvu", "djvu", url, source_page, title, job_id, resp=resp))
 
     try:
         im = Image.open(io.BytesIO(raw))
         im.load()
-    except Exception:
-        # Not PDF, not HTML, not ZIP/EPUB, not DjVu, and Pillow — which
-        # does its own signature-based format sniffing, not extension or
-        # Content-Type — doesn't recognize it either. Genuinely unknown,
-        # not a bug to chase: report it as exactly that instead of leaking
-        # Pillow's raw "cannot identify image file <...>" exception text.
+    except Exception as exc:
+        # Unknown may be text, a damaged file, or an unsupported format.
+        # Keep the evidence for inspection instead of declaring it unsupported.
         signature = raw[:8].hex()
-        _log_fetch_failure(url, "unknown binary signature", resp)
+        diagnostic_result = _diagnose_unknown_response(raw, url, resp, exc)
         raise DownloadError(
             f"UNKNOWN_BINARY (Content-Type: {content_type or 'unknown'}, signature: {signature}): "
-            f"지원하지 않는 파일 형식입니다."
-        )
+            f"응답 형식을 식별하지 못했습니다. 첫 512바이트 진단 로그 확인. {diagnostic_result}"
+        ) from exc
 
     fmt = im.format or "JPEG"
     orig_ext = FORMAT_EXT.get(fmt, "bin")
@@ -435,4 +477,4 @@ def download_and_process(
         "drive_url": None,
     }
     db.insert_image(record)
-    return record
+    return resolved_record(record)

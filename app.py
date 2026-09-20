@@ -1,4 +1,5 @@
 import io
+import os
 import re
 import threading
 import uuid
@@ -17,12 +18,13 @@ import extractor_worker
 import listing
 import net
 import pipeline
+import pdf_worker
 import settings
 import sheets
-from queue_config import POLL_SECONDS, SPREADSHEET_ID, SPREADSHEET_URL
+from queue_config import POLL_SECONDS, SPREADSHEET_ID, SPREADSHEET_URL, PDF_SHEET_NAME, PDF_SHEET_URL
 from scrape import (
     extract_file_links, extract_images_from_html, extract_links_from_html, file_ext_of, file_name_key,
-    filter_navigation_links,
+    filter_navigation_links, http_link,
 )
 
 app = Flask(__name__)
@@ -30,12 +32,13 @@ db.init_db()
 
 # ---------------------------------------------------------------------------
 # Background queue workers, controlled from the web UI instead of running as
-# always-on console windows. Off by default; a click starts/stops them.
+# always-on console windows. Image workers start on demand; PDF starts with app.py.
 # ---------------------------------------------------------------------------
 
 _workers = {
     "extractor": {"thread": None, "stop": None, "run_once": extractor_worker.run_once, "busy": threading.Lock()},
     "download": {"thread": None, "stop": None, "run_once": download_worker.run_once, "busy": threading.Lock()},
+    "pdf": {"thread": None, "stop": None, "run_once": pdf_worker.run_once, "busy": threading.Lock()},
 }
 _workers_lock = threading.Lock()
 
@@ -74,19 +77,24 @@ def api_workers_status():
         })
 
 
-@app.route("/api/workers/<name>/start", methods=["POST"])
-def api_workers_start(name):
-    if name not in _workers:
-        return jsonify({"success": False, "error": "알 수 없는 워커"}), 404
+def start_worker(name):
     with _workers_lock:
         w = _workers[name]
         if w["thread"] and w["thread"].is_alive():
-            return jsonify({"success": True, "status": "running"})
+            w["stop"].clear()
+            return
         stop_event = threading.Event()
         thread = threading.Thread(target=_worker_loop, args=(name, stop_event), daemon=True)
         w["stop"] = stop_event
         w["thread"] = thread
         thread.start()
+
+
+@app.route("/api/workers/<name>/start", methods=["POST"])
+def api_workers_start(name):
+    if name not in _workers:
+        return jsonify({"success": False, "error": "알 수 없는 워커"}), 404
+    start_worker(name)
     return jsonify({"success": True, "status": "running"})
 
 
@@ -234,12 +242,78 @@ def index():
 
 @app.route("/pdf")
 def pdf_page():
-    return render_template("pdf.html")
+    return render_template("pdf.html", pdf_sheet_url=PDF_SHEET_URL)
+
+
+@app.route("/api/pdf-queue/status")
+def api_pdf_queue_status():
+    with _workers_lock:
+        w = _workers["pdf"]
+        running = bool(w["thread"] and w["thread"].is_alive() and not w["stop"].is_set())
+    return jsonify({**pdf_worker.status(), "running": running, "spreadsheet_url": PDF_SHEET_URL})
+
+
+@app.route("/api/pdf-queue/add", methods=["POST"])
+def api_pdf_queue_add():
+    data = request.get_json(force=True) or {}
+    items = data.get("submissions")
+    if items is None:
+        urls = data.get("urls")
+        items = [{"url": value, "folder": data.get("folder") or "PDF"} for value in urls] if isinstance(urls, list) else []
+    if not isinstance(items, list) or not items or len(items) > 200:
+        return jsonify({"success": False, "error": "URL을 1~200개 입력하세요."}), 400
+
+    rows = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = (item.get("url") or "").strip()
+        if not url:
+            continue
+        if not http_link("", url):
+            return jsonify({"success": False, "error": "http:// 또는 https:// URL을 입력하세요."}), 400
+        if url in seen:
+            continue
+        seen.add(url)
+        row = {
+            "url": url,
+            "folder": str(item.get("folder") or data.get("folder") or "PDF"),
+            "status": "pending",
+        }
+        for key, value in (
+            ("source_page", item.get("source_page")),
+            ("title", item.get("title")),
+            ("expected_md5", item.get("expected_md5")),
+        ):
+            if value:
+                row[key] = str(value)[:150] if key == "title" else str(value)
+        rows.append(row)
+    if not rows:
+        return jsonify({"success": False, "error": "URL이 필요합니다."}), 400
+    try:
+        sheets.append_rows(SPREADSHEET_ID, PDF_SHEET_NAME, rows, sheets.PDF_HEADERS)
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
+    return jsonify({"success": True, "added": len(rows)})
 
 
 @app.route("/api/pdfs/recent")
 def api_pdfs_recent():
     return jsonify({"pdfs": db.list_by_mime_prefix("application/pdf")})
+
+
+@app.route("/api/files/<file_id>/download")
+def api_download_saved_file(file_id):
+    record = db.get_image(file_id)
+    if not record:
+        return jsonify({"error": "저장된 파일을 찾을 수 없습니다."}), 404
+    root = pipeline.DOWNLOADS_DIR.resolve()
+    path = (root / record["local_path"]).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        return jsonify({"error": "저장된 파일을 찾을 수 없습니다."}), 404
+    return send_file(path, mimetype=record["mime_type"] or "application/octet-stream",
+                     as_attachment=True, download_name=record["filename"])
 
 
 @app.route("/api/links/extract", methods=["POST"])
@@ -389,6 +463,7 @@ def api_submissions_add():
             continue
         rows.append({
             "id": f"sub_{uuid.uuid4().hex[:12]}",
+            "kind": "file" if item.get("kind") == "file" else "image",
             "url": url,
             "source_page": item.get("source_page") or "",
             "title": (item.get("title") or "")[:150],
@@ -530,6 +605,7 @@ def api_download_image():
             # request — e.g. the user's own already-logged-in session
             # cookies for a site they have legitimate access to.
             cookies=data.get("cookies") if isinstance(data.get("cookies"), dict) else None,
+            expected_md5=data.get("expected_md5", ""),
         )
     except pipeline.DownloadError as e:
         return jsonify({"success": False, "url": url, "error": str(e)}), 400
@@ -557,6 +633,7 @@ def api_download_batch():
                 source_page=(item.get("source_page") or "").strip(),
                 title=(item.get("title") or "").strip(),
                 folder=folder,
+                expected_md5=item.get("expected_md5", ""),
             )
             results.append({"success": True, "file_id": record["id"], **record})
         except pipeline.DownloadError as e:
@@ -657,4 +734,6 @@ def api_drive_upload_job():
 
 
 if __name__ == "__main__":
+    if os.environ.get("PDF_AUTO_START", "1") != "0":
+        start_worker("pdf")
     app.run(debug=False, port=5000, threaded=True)

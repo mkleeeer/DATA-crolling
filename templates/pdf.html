@@ -7,6 +7,8 @@
   :root { color-scheme: light dark; }
   body { font-family: -apple-system, "Segoe UI", sans-serif; max-width: 1000px; margin: 40px auto; padding: 0 16px; }
   h1 { font-size: 1.4rem; }
+  textarea { box-sizing: border-box; width: 100%; padding: 12px; border: 1px solid #999; border-radius: 6px; font: inherit; }
+  #queueStatus, #queueResult { white-space: pre-wrap; font-size: .9rem; margin: 12px 0; }
   .nav { margin-bottom: 16px; font-size: 0.9rem; }
   .nav a { color: #2563eb; text-decoration: none; }
   .nav a:hover { text-decoration: underline; }
@@ -62,15 +64,37 @@
   <h1>PDF 크롤러</h1>
 
   <section class="panel">
-    <h2>PDF URL 바로 다운로드</h2>
+    <h2>PDF 시트 자동 다운로드</h2>
+    <p><a href="{{ pdf_sheet_url }}" target="_blank" rel="noopener">PDF 전용 시트 열기 ↗</a> · <strong>A열에 URL을 한 줄씩 입력</strong>하면 자동으로 받습니다.</p>
+    <p>이 컴퓨터에서 앱이 실행되는 동안 10초 간격으로 확인합니다. 저장 폴더 기본값은 PDF이며, 완료 후 시트에 파일명·저장 경로가 표시됩니다.</p>
+    <textarea id="queueUrls" rows="4" aria-label="PDF 시트에 추가할 URL" placeholder="여기서도 여러 URL을 한 줄에 하나씩 붙여넣을 수 있습니다."></textarea>
+    <div class="link-controls">
+      <input type="text" id="queueFolder" aria-label="PDF 저장 폴더" placeholder="폴더명 (기본: PDF)">
+      <button id="queueAddBtn">PDF 시트에 추가</button>
+      <button id="queueRunBtn">지금 처리</button>
+      <button id="queueStartBtn" disabled>자동 실행</button>
+      <button id="queueStopBtn" class="secondary" disabled>자동 정지</button>
+    </div>
+    <div id="queueStatus" role="status">자동 처리 상태를 확인하는 중...</div>
+    <div id="queueResult" role="status"></div>
+    <p><strong>지금 처리</strong>는 시트에 저장된 대기 링크를 즉시 읽어 한 번 처리합니다. 자동 처리가 꺼져 있어도 사용할 수 있습니다. 시트 수정이 저장된 뒤 눌러주세요.</p>
+    <p>실패한 행은 I열의 원인을 확인하고 D열(status)을 <code>pending</code>으로 바꾸면 재시도합니다. 중지하면 현재 파일 처리 후 멈춥니다.</p>
+  </section>
+
+  <section class="panel">
+    <h2>파일·설명 페이지·미러 URL 다운로드</h2>
     <div class="row">
-      <input type="text" id="manualUrl" placeholder="PDF 직접 링크">
+      <input type="text" id="manualUrl" placeholder="파일 직접 링크 또는 다운로드·미러 페이지 URL">
       <input type="text" id="manualFolder" placeholder="폴더명(선택)" style="flex: 0 0 160px;">
       <button id="manualBtn">다운로드</button>
     </div>
+    <div class="row">
+      <input type="text" id="expectedMd5" placeholder="MD5 (선택, 32자리) — 알고 있는 파일 지문과 대조" aria-label="MD5 (선택)">
+    </div>
     <p style="color:#666; font-size:0.9rem; margin-top:0;">
-      PDF URL을 넣으면 그대로 다운로드합니다. 이미지 크롤러와 같은 다운로드 엔진을
-      쓰고 있어서, 사이트가 막아둔 경우에도 서버가 대신 요청해서 가져옵니다.
+      페이지에 표시된 다운로드·미러 링크를 최대 4단계 따라갑니다. 실패한 미러는 다음 후보로 넘어갑니다.
+      URL에 MD5가 명시되어 있거나 직접 입력하면 받은 원본과 대조합니다.
+      PDF·EPUB·ZIP·DjVu·이미지를 지원하며, 로그인이나 JavaScript 조작이 필요한 페이지는 자동 처리하지 못할 수 있습니다.
     </p>
     <div id="manualResult"></div>
   </section>
@@ -131,20 +155,124 @@
   </section>
 
 <script>
+let queueRunning = false;
+let queueControlPending = false;
+let queueStateKnown = false;
+let lastDownloaded = -1;
+function updateQueueControls() {
+  document.getElementById('queueStartBtn').disabled = !queueStateKnown || queueControlPending || queueRunning;
+  document.getElementById('queueStopBtn').disabled = !queueStateKnown || queueControlPending || !queueRunning;
+}
+async function loadQueueStatus() {
+  try {
+    const res = await fetch('/api/pdf-queue/status');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    queueRunning = data.running;
+    queueStateKnown = true;
+    updateQueueControls();
+    const c = data.counts || {};
+    document.getElementById('queueStatus').textContent = `${queueRunning ? '자동 처리 켜짐' : '자동 처리 꺼짐'} · 대기 ${c.pending || 0} · 받는 중 ${c.downloading || 0} · 완료 ${c.downloaded || 0} · 실패 ${c.failed || 0}\n마지막 확인: ${data.checked_at || '첫 확인 중'}${data.error ? '\n연결/기록 오류: ' + data.error : ''}`;
+    if (lastDownloaded !== (c.downloaded || 0)) {
+      lastDownloaded = c.downloaded || 0;
+      loadPdfList();
+    }
+  } catch (e) {
+    queueStateKnown = false;
+    updateQueueControls();
+    document.getElementById('queueStatus').textContent = '앱 연결 실패: ' + e;
+  }
+}
+document.getElementById('queueRunBtn').onclick = async () => {
+  const btn = document.getElementById('queueRunBtn');
+  const result = document.getElementById('queueResult');
+  btn.disabled = true;
+  btn.textContent = '처리 중...';
+  result.textContent = '시트를 바로 확인하고 대기 링크를 처리하고 있습니다...';
+  try {
+    const res = await fetch('/api/workers/pdf/run-once', {method: 'POST'});
+    const data = await res.json();
+    if (data.busy) {
+      result.textContent = '이미 PDF를 처리 중입니다. 진행 상태를 확인해주세요.';
+    } else if (!res.ok || !data.success) {
+      throw new Error(data.error || `HTTP ${res.status}`);
+    } else {
+      result.textContent = data.handled
+        ? `${data.handled}개 행의 처리를 마쳤습니다. 성공·실패 결과는 위 상태와 시트에서 확인하세요.`
+        : '시트를 확인했습니다. 새로 처리할 대기 링크가 없습니다. 방금 입력했다면 시트 저장 후 다시 눌러주세요.';
+    }
+  } catch (e) {
+    result.textContent = '요청 확인 실패: ' + e + '. 진행 상태를 확인한 뒤 다시 시도하세요.';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '지금 처리';
+    await loadQueueStatus();
+    loadPdfList();
+  }
+};
+async function setQueueRunning(action) {
+  queueControlPending = true;
+  updateQueueControls();
+  try {
+    const res = await fetch(`/api/workers/pdf/${action}`, {method: 'POST'});
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || `HTTP ${res.status}`);
+    document.getElementById('queueResult').textContent = action === 'start'
+      ? 'PDF 자동 처리를 실행했습니다. 시트의 대기 링크를 계속 확인합니다.'
+      : 'PDF 자동 정지를 요청했습니다. 처리 중인 파일이 있으면 완료 후 멈춥니다.';
+  } catch (e) { document.getElementById('queueResult').textContent = '상태 변경 실패: ' + e; }
+  finally {
+    await loadQueueStatus();
+    queueControlPending = false;
+    updateQueueControls();
+  }
+}
+document.getElementById('queueStartBtn').onclick = () => setQueueRunning('start');
+document.getElementById('queueStopBtn').onclick = () => setQueueRunning('stop');
+document.getElementById('queueAddBtn').onclick = async () => {
+  const input = document.getElementById('queueUrls');
+  const urls = input.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const result = document.getElementById('queueResult');
+  if (!urls.length) { result.textContent = 'URL을 입력하세요.'; return; }
+  const btn = document.getElementById('queueAddBtn');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/pdf-queue/add', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({urls, folder: document.getElementById('queueFolder').value.trim()})});
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error);
+    input.value = '';
+    result.textContent = `${data.added}개를 PDF 시트에 추가했습니다. ${queueRunning ? '차례로 자동 다운로드합니다.' : '자동 실행을 눌러주세요.'}`;
+    await loadQueueStatus();
+  } catch (e) { result.textContent = '추가 실패: ' + e; }
+  finally { btn.disabled = false; }
+};
+loadQueueStatus();
+setInterval(loadQueueStatus, 5000);
+
 async function loadPdfList() {
   document.getElementById("pdfListMsg").textContent = "불러오는 중...";
   try {
     const res = await fetch("/api/pdfs/recent");
     const data = await res.json();
     const pdfs = data.pdfs || [];
-    document.getElementById("pdfTableBody").innerHTML = pdfs.map(p => `
-      <tr>
-        <td>${p.filename}</td>
-        <td>${p.job_id}</td>
-        <td class="url-cell"><a href="${p.source_url}" target="_blank" title="${p.source_url}">${p.source_url}</a></td>
-        <td>${p.created_at}</td>
-      </tr>
-    `).join("");
+    const table = document.getElementById("pdfTableBody");
+    table.replaceChildren();
+    for (const p of pdfs) {
+      const row = document.createElement("tr");
+      const fileCell = document.createElement("td");
+      const fileLink = document.createElement("a");
+      fileLink.href = `/api/files/${encodeURIComponent(p.id)}/download`;
+      fileLink.textContent = `${p.filename} — 파일 받기`;
+      fileCell.append(fileLink);
+      row.append(fileCell);
+      for (const value of [p.job_id, p.source_url, p.created_at]) {
+        const cell = document.createElement("td");
+        cell.textContent = value || "";
+        row.append(cell);
+      }
+      table.append(row);
+    }
     document.getElementById("pdfListMsg").textContent = `${pdfs.length}개`;
   } catch (e) {
     document.getElementById("pdfListMsg").textContent = "불러오기 실패: " + e;
@@ -154,6 +282,7 @@ async function loadPdfList() {
 document.getElementById("manualBtn").onclick = async () => {
   const url = document.getElementById("manualUrl").value.trim();
   const folder = document.getElementById("manualFolder").value.trim();
+  const expected_md5 = document.getElementById("expectedMd5").value.trim();
   const resultEl = document.getElementById("manualResult");
   if (!url) { resultEl.innerHTML = `<span class="fail">URL을 입력하세요.</span>`; return; }
   const btn = document.getElementById("manualBtn");
@@ -164,20 +293,24 @@ document.getElementById("manualBtn").onclick = async () => {
     const res = await fetch("/api/images/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, folder }),
+      body: JSON.stringify({ url, folder, expected_md5 }),
     });
     const data = await res.json();
     if (data.success) {
-      resultEl.innerHTML = data.duplicate
-        ? `<span class="ok">이미 받은 파일입니다 — 새로 저장하지 않음: ${data.filename} (${data.job_id})</span>`
-        : `<span class="ok">완료: ${data.filename} (${data.job_id})</span>`;
+      resultEl.style.whiteSpace = "pre-wrap";
+      const outcome = data.duplicate ? "이미 받은 파일 — 새로 저장하지 않음" : "완료";
+      resultEl.textContent = `${outcome}: ${data.filename} (${data.job_id})\n최종 주소: ${data.resolved_url || data.source_url}\nMD5: ${data.md5 || "-"} (${data.md5_verified ? "일치 확인" : "비교할 지문 미지정"})`;
+      const fileLink = document.createElement("a");
+      fileLink.href = `/api/files/${encodeURIComponent(data.file_id)}/download`;
+      fileLink.textContent = "파일 받기";
+      resultEl.append(document.createElement("br"), fileLink);
       document.getElementById("manualUrl").value = "";
       loadPdfList();
     } else {
-      resultEl.innerHTML = `<span class="fail">실패: ${data.error}</span>`;
+      resultEl.textContent = `실패: ${data.error}`;
     }
   } catch (e) {
-    resultEl.innerHTML = `<span class="fail">요청 실패: ${e}</span>`;
+    resultEl.textContent = `요청 실패: ${e}`;
   } finally {
     btn.disabled = false;
     btn.textContent = "다운로드";
@@ -499,13 +632,12 @@ document.getElementById("linkQueueBtn").onclick = async () => {
   const resultEl = document.getElementById("linkQueueResult");
   if (pickedLinks.length === 0) { resultEl.innerHTML = `<span class="fail">선택된 링크가 없습니다.</span>`; return; }
 
-  const pageUrl = document.getElementById("linkPageUrl").value.trim();
   const folder = document.getElementById("linkFolder").value.trim();
   const btn = document.getElementById("linkQueueBtn");
   btn.disabled = true;
   resultEl.textContent = `${pickedLinks.length}개 큐에 추가하는 중...`;
   try {
-    const res = await fetch("/api/submissions/add", {
+    const res = await fetch("/api/pdf-queue/add", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -514,15 +646,16 @@ document.getElementById("linkQueueBtn").onclick = async () => {
     });
     const data = await res.json();
     if (!data.success) { resultEl.innerHTML = `<span class="fail">실패: ${esc(data.error)}</span>`; return; }
-    resultEl.innerHTML = `<span class="ok">${data.added}개 큐에 추가함 — 지금 처리 중...</span>`;
-    // 매 10초 자동 감시를 기다리지 않고 바로 한 번 처리 — 워커가 정지 상태여도
-    // "지금 처리"와 동일하게 즉시 한 번은 돌려줌.
-    await fetch("/api/workers/extractor/run-once", { method: "POST" });
-    await fetch("/api/workers/download/run-once", { method: "POST" });
-    resultEl.innerHTML = `<span class="ok">${data.added}개 큐에 추가하고 1차 처리까지 완료. 이미지 크롤러 페이지의 큐 목록에서 진행 상황을 볼 수 있습니다.</span>`;
+    resultEl.innerHTML = `<span class="ok">${data.added}개를 PDF 시트에 추가함 — 지금 처리 중...</span>`;
+    const runRes = await fetch("/api/workers/pdf/run-once", { method: "POST" });
+    const runData = await runRes.json();
+    resultEl.innerHTML = runData.busy
+      ? `<span class="ok">${data.added}개를 추가했습니다. 이미 자동 처리 중입니다.</span>`
+      : `<span class="ok">${data.added}개를 추가하고 ${runData.handled || 0}개를 처리했습니다.</span>`;
+    loadQueueStatus();
     loadPdfList();
   } catch (e) {
-    resultEl.innerHTML = `<span class="fail">요청 실패: ${e}</span>`;
+    resultEl.textContent = `요청 실패: ${e}`;
   } finally {
     btn.disabled = false;
   }

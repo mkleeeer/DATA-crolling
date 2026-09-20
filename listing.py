@@ -8,12 +8,12 @@ post URL by hand.
 """
 import re
 from collections import defaultdict
-from urllib.parse import parse_qsl, urldefrag, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, urldefrag, urlencode, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
 import net
-from scrape import file_ext_of, is_generic_link_text
+from scrape import file_ext_of, http_link, is_generic_link_text
 
 _MIN_POSTS = 5
 _DATE_RE = re.compile(r"((?:19|20)\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})")
@@ -80,8 +80,11 @@ def detect_posts(html: str, page_url: str) -> list:
         href = a["href"].strip()
         if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
             continue
-        url = urldefrag(urljoin(page_url, href))[0]
-        if urlparse(url).scheme not in ("http", "https") or file_ext_of(urlparse(url).path):
+        url = http_link(page_url, href)
+        if not url:
+            continue
+        url = urldefrag(url)[0]
+        if file_ext_of(urlparse(url).path):
             continue
         title = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
         if is_generic_link_text(title):  # "첨부파일 전체다운로드" buttons repeat per row too

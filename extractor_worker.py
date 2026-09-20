@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime
 
 import net
+import resolver
 import settings
 import sheets
 from queue_config import POLL_SECONDS, SPREADSHEET_ID
@@ -123,7 +124,9 @@ def process_submission(row: dict) -> None:
         finally:
             resp.close()
 
-        if is_direct_file:
+        if row.get("kind") == "file" or resolver.url_md5(url) or is_direct_file:
+            # File submissions keep ONE original URL so the downloader can
+            # resolve mirrors/checksums rather than queueing a book cover.
             candidates = [{"url": url, "alt": title}]
         elif settings.get_only_og_image():
             if not source_page:

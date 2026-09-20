@@ -15,6 +15,27 @@ _JUNK_URL_PATTERNS = re.compile(
 )
 
 
+def http_link(page_url: str, href: str) -> str:
+    """Ignore unsupported or malformed links without aborting the whole page."""
+    if not isinstance(href, str):
+        return ""
+    href = href.strip()
+    if not href or href.startswith("#"):
+        return ""
+    scheme = re.match(r"^([a-z][a-z0-9+.-]*):", href, re.I)
+    if scheme and scheme.group(1).lower() not in {"http", "https"}:
+        return ""  # e.g. ed2k filenames can contain [] that urlparse rejects
+    try:
+        absolute = urljoin(page_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        parsed.port  # validate malformed port/authority as well
+    except ValueError:
+        return ""
+    return absolute
+
+
 def _looks_like_junk(url: str) -> bool:
     path = urlparse(url).path.lower()
     # MediaWiki-style thumbnail URLs embed the *original* filename mid-path
@@ -39,7 +60,9 @@ def find_pdf_links(soup: BeautifulSoup, page_url: str, limit: int = 5) -> list:
         href = a["href"].strip()
         if not href or href.startswith(("javascript:", "mailto:", "#")):
             continue
-        absolute = urljoin(page_url, href)
+        absolute = http_link(page_url, href)
+        if not absolute:
+            continue
         path = urlparse(absolute).path.lower()
         if not path.endswith(".pdf") or absolute in seen:
             continue
@@ -62,7 +85,9 @@ def extract_links_from_html(html: str, page_url: str) -> list:
         href = a["href"].strip()
         if not href or href.startswith(("javascript:", "mailto:", "tel:", "ftp:", "#")):
             continue
-        absolute = urljoin(page_url, href)
+        absolute = http_link(page_url, href)
+        if not absolute:
+            continue
         if absolute in seen:
             continue
         seen.add(absolute)
@@ -201,10 +226,11 @@ def extract_file_links(html: str, page_url: str) -> tuple[list, list]:
         href = a["href"].strip()
         if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
             continue
-        absolute = urldefrag(urljoin(page_url, href))[0]
-        parsed = urlparse(absolute)
-        if parsed.scheme not in ("http", "https"):
+        absolute = http_link(page_url, href)
+        if not absolute:
             continue
+        absolute = urldefrag(absolute)[0]
+        parsed = urlparse(absolute)
         labels = [re.sub(r"\s+", " ", t).strip() for t in (a.get_text(" ", strip=True), a.get("title") or "")]
         name = next((t for t in labels if not is_generic_link_text(t)), None)
 

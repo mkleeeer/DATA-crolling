@@ -6,12 +6,16 @@ from googleapiclient.errors import HttpError
 
 import drive
 
-SUBMISSIONS_HEADERS = ["id", "url", "source_page", "title", "folder", "status", "error", "created_at"]
+SUBMISSIONS_HEADERS = ["id", "url", "source_page", "title", "folder", "status", "error", "created_at", "kind"]
 IMAGES_HEADERS = [
     "id", "submission_id", "folder", "seq", "source_url", "source_page", "title", "status",
     "filename", "local_path", "original_path", "mime_type", "width", "height",
     "drive_file_id", "drive_url", "error", "created_at", "updated_at",
 ]
+# Keep the original ten columns in place so existing `pdfs` tabs remain
+# readable; metadata added by the integrated link finder lives in K/L.
+PDF_HEADERS = ["url", "folder", "expected_md5", "status", "filename", "local_path",
+               "file_id", "md5", "error", "updated_at", "source_page", "title"]
 
 # googleapiclient's service object wraps an httplib2 connection that is not
 # safe to share across threads — concurrent calls on the same service (e.g.
