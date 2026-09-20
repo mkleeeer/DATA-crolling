@@ -1,5 +1,23 @@
 # Development log
 
+## 2026-09-20 — Repair integrated UI and authentication flow
+
+- Fixed the missing `pageUrl` in the link-selection click handler, which
+  prevented queue submission before any HTTP request was sent.
+- A failed immediate worker pass now reports the failure and explains that
+  the links are already queued, instead of claiming zero rows completed.
+- Interactive Google authorization is explicitly started from the PDF page,
+  runs separately with a 120-second wait limit, and publishes its state.
+  Queue polling without credentials fails promptly instead of holding the
+  worker lock forever or repeatedly opening login windows.
+- Restored landing-page link labels as filenames through multi-hop resolution;
+  retained server filename precedence and duplicate checksum checks.
+- Validation: 34 Python tests and three executable JavaScript click scenarios
+  pass. Live browser verification confirmed the new controls and immediate
+  missing-authentication response. A public W3C sample download did not complete
+  within the test client's 45-second timeout; external download success and
+  authenticated Google Sheets processing are not verified in this run.
+
 ## 2026-09-11 (KST) — Preserve UNKNOWN_BINARY evidence
 
 - Report: an unrecognized response had signature `46696e616e636961`

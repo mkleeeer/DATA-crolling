@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -21,7 +22,51 @@ class DriveNotConfigured(Exception):
     pass
 
 
+_credential_lock = threading.Lock()
+_auth_state_lock = threading.Lock()
+_auth_state = {"running": False, "error": ""}
+
+
+def auth_status():
+    with _auth_state_lock:
+        return {**_auth_state, "configured": CLIENT_SECRET_FILE.exists(),
+                "authorized": TOKEN_FILE.exists()}
+
+
+def start_authorization():
+    """Only an explicit UI action opens the browser, never a polling worker."""
+    with _auth_state_lock:
+        if _auth_state["running"]:
+            return
+        _auth_state.update(running=True, error="")
+
+    def authorize():
+        error = ""
+        try:
+            with _credential_lock:
+                if not CLIENT_SECRET_FILE.exists():
+                    raise DriveNotConfigured("client_secret.json이 없습니다. 앱 폴더에 Google OAuth 설정 파일을 넣어주세요.")
+                flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET_FILE), SCOPES)
+                creds = flow.run_local_server(port=0, timeout_seconds=120)
+                TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+        except Exception:
+            error = "Google 인증을 완료하지 못했습니다. 연결 버튼을 눌러 다시 승인해주세요."
+        finally:
+            with _auth_state_lock:
+                _auth_state.update(running=False, error=error)
+
+    threading.Thread(target=authorize, daemon=True).start()
+
+
 def get_credentials() -> Credentials:
+    # Do not hold a queue/API request open while waiting for user interaction.
+    if auth_status()["running"]:
+        raise DriveNotConfigured("Google 승인 대기 중입니다. 열린 브라우저에서 승인을 완료해주세요.")
+    with _credential_lock:
+        return _load_credentials()
+
+
+def _load_credentials() -> Credentials:
     if not CLIENT_SECRET_FILE.exists():
         raise DriveNotConfigured(
             f"{CLIENT_SECRET_FILE.name}이(가) 없습니다. Google Cloud Console에서 OAuth 클라이언트(데스크톱 앱)를 "
@@ -36,8 +81,7 @@ def get_credentials() -> Credentials:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET_FILE), SCOPES)
-            creds = flow.run_local_server(port=0)
+            raise DriveNotConfigured("Google 계정 연결이 필요합니다. PDF 화면의 Google 연결 버튼을 눌러주세요.")
         TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
     return creds

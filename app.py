@@ -253,6 +253,17 @@ def api_pdf_queue_status():
     return jsonify({**pdf_worker.status(), "running": running, "spreadsheet_url": PDF_SHEET_URL})
 
 
+@app.route("/api/google-auth/status")
+def api_google_auth_status():
+    return jsonify(drive.auth_status())
+
+
+@app.route("/api/google-auth/start", methods=["POST"])
+def api_google_auth_start():
+    drive.start_authorization()
+    return jsonify({"success": True, **drive.auth_status()})
+
+
 @app.route("/api/pdf-queue/add", methods=["POST"])
 def api_pdf_queue_add():
     data = request.get_json(force=True) or {}
@@ -268,7 +279,10 @@ def api_pdf_queue_add():
     for item in items:
         if not isinstance(item, dict):
             continue
-        url = (item.get("url") or "").strip()
+        value = item.get("url")
+        if not isinstance(value, str):
+            continue
+        url = value.strip()
         if not url:
             continue
         if not http_link("", url):

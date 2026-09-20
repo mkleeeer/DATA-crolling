@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl, unquote, urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from PIL import Image
-from scrape import http_link, _looks_like_nav_link
+from scrape import http_link, _looks_like_nav_link, is_generic_link_text
 
 
 class ResolutionError(Exception):
@@ -163,7 +163,22 @@ def resolve(initial, requested_url, fetch, diagnose, expected_md5="", max_depth=
                 remaining -= 1
                 log("try", url=candidate, from_url=final, depth=depth + 1)
                 child = fetch(candidate, final)
-                return visit(child, depth + 1, checksum or candidate_id)
+                result = visit(child, depth + 1, checksum or candidate_id)
+                # Preserve the landing page's human-readable filename even
+                # when the final URL is an opaque download endpoint.
+                if not getattr(result[0], "download_link_text", ""):
+                    soup = BeautifulSoup(raw[:2_000_000], "html.parser")
+                    base = soup.find("base", href=True)
+                    base_url = (http_link(final, base["href"]) if base else "") or final
+                    for tag in soup.find_all("a", href=True):
+                        target = http_link(base_url, tag["href"])
+                        if target and urldefrag(target)[0] == candidate:
+                            label = next((s for s in (tag.get("title", ""), tag.get_text(" ", strip=True))
+                                          if s and not is_generic_link_text(s)), "")
+                            if label:
+                                result[0].download_link_text = label
+                                break
+                return result
             except Exception as exc:
                 failures.append(str(exc))
                 log("candidate_failed", url=candidate, reason=str(exc))

@@ -65,6 +65,7 @@
 
   <section class="panel">
     <h2>PDF 시트 자동 다운로드</h2>
+    <div class="link-controls"><button id="googleConnectBtn">Google 연결</button><span id="googleAuthStatus" role="status"></span></div>
     <p><a href="{{ pdf_sheet_url }}" target="_blank" rel="noopener">PDF 전용 시트 열기 ↗</a> · <strong>A열에 URL을 한 줄씩 입력</strong>하면 자동으로 받습니다.</p>
     <p>이 컴퓨터에서 앱이 실행되는 동안 10초 간격으로 확인합니다. 저장 폴더 기본값은 PDF이며, 완료 후 시트에 파일명·저장 경로가 표시됩니다.</p>
     <textarea id="queueUrls" rows="4" aria-label="PDF 시트에 추가할 URL" placeholder="여기서도 여러 URL을 한 줄에 하나씩 붙여넣을 수 있습니다."></textarea>
@@ -155,6 +156,28 @@
   </section>
 
 <script>
+async function loadAuthStatus() {
+  const btn = document.getElementById('googleConnectBtn');
+  const label = document.getElementById('googleAuthStatus');
+  try {
+    const res = await fetch('/api/google-auth/status');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    btn.disabled = data.running;
+    btn.textContent = data.authorized ? 'Google 다시 연결' : 'Google 연결';
+    label.textContent = data.running ? '브라우저에서 Google 승인을 완료해주세요. (최대 2분 대기)' :
+      data.error || (data.authorized ? '인증 정보 저장됨' : data.configured ? 'Google 연결이 필요합니다.' : '앱 폴더에 client_secret.json이 필요합니다.');
+  } catch (e) { label.textContent = '연결 상태 확인 실패: ' + e; }
+}
+document.getElementById('googleConnectBtn').onclick = async () => {
+  try {
+    const res = await fetch('/api/google-auth/start', {method: 'POST'});
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    await loadAuthStatus();
+  } catch (e) { document.getElementById('googleAuthStatus').textContent = '연결 시작 실패: ' + e; }
+};
+loadAuthStatus();
+setInterval(loadAuthStatus, 3000);
 let queueRunning = false;
 let queueControlPending = false;
 let queueStateKnown = false;
@@ -632,6 +655,7 @@ document.getElementById("linkQueueBtn").onclick = async () => {
   const resultEl = document.getElementById("linkQueueResult");
   if (pickedLinks.length === 0) { resultEl.innerHTML = `<span class="fail">선택된 링크가 없습니다.</span>`; return; }
 
+  const pageUrl = document.getElementById("linkPageUrl").value.trim();
   const folder = document.getElementById("linkFolder").value.trim();
   const btn = document.getElementById("linkQueueBtn");
   btn.disabled = true;
@@ -649,6 +673,11 @@ document.getElementById("linkQueueBtn").onclick = async () => {
     resultEl.innerHTML = `<span class="ok">${data.added}개를 PDF 시트에 추가함 — 지금 처리 중...</span>`;
     const runRes = await fetch("/api/workers/pdf/run-once", { method: "POST" });
     const runData = await runRes.json();
+    if (!runData.busy && (!runRes.ok || !runData.success)) {
+      resultEl.textContent = `${data.added}개는 시트에 추가됐지만 처리하지 못했습니다: ${runData.error || 'HTTP ' + runRes.status}. 다시 추가하지 말고 위의 지금 처리를 눌러주세요.`;
+      await loadQueueStatus();
+      return;
+    }
     resultEl.innerHTML = runData.busy
       ? `<span class="ok">${data.added}개를 추가했습니다. 이미 자동 처리 중입니다.</span>`
       : `<span class="ok">${data.added}개를 추가하고 ${runData.handled || 0}개를 처리했습니다.</span>`;

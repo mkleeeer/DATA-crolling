@@ -181,6 +181,7 @@ def _save_raw(
 
     job_seq = db.next_job_seq(job_id)
     daily_seq = db.next_daily_seq()
+    link_text = link_text or getattr(resp, "download_link_text", None)
     stem = _pick_filename_stem(ext, title, resp, link_text, url) or f"{job_seq:02d}"
     out_path = _unique_path(converted_dir, stem, ext)
     out_path.write_bytes(raw)
